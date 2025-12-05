@@ -11,103 +11,7 @@ import matplotlib.dates as mdates
 import matplotlib.ticker as mticker
 from datetime import datetime, timedelta
 
-def generate_synthetic_data(hours=2000, end_date=None):
-    """
-    Generate synthetic OHLCV data for testing.
-    """
-    print(f"Generating {hours} hours of Synthetic Data (Random Walk)...")
-    
-    if end_date:
-        end = pd.to_datetime(end_date)
-    else:
-        end = pd.Timestamp.now()
-        
-    dates = pd.date_range(end=end, periods=hours, freq='h')
-    
-    # Generate Trending Data (Sine Wave + Trend + Noise)
-    # This ensures Hurst > 0.55 so the bot WILL trade
-    t = np.linspace(0, 4*np.pi, hours)
-    trend = np.linspace(0, 20, hours) # Strong uptrend
-    cycle = 5 * np.sin(t)             # Clear cycles
-    noise = np.random.randn(hours) * 0.5
-    
-    price = 100 + trend + cycle + noise
-    df = pd.DataFrame({'close': price}, index=dates)
-    return df
-
-async def fetch_historical_data(symbol='BTC/USDT', timeframe='1h', limit=1000, end_date=None):
-    """
-    Fetch real historical OHLCV data from Binance with pagination.
-    """
-    print(f"Fetching {limit} candles of real data for {symbol}...")
-    exchange = ccxt.binance()
-    try:
-        if end_date:
-            end_ts = int(pd.to_datetime(end_date).timestamp() * 1000)
-        else:
-            end_ts = exchange.milliseconds()
-            
-        all_ohlcv = []
-        remaining = limit
-        
-        while remaining > 0:
-            fetch_limit = min(remaining, 1000)
-            # Calculate 'since' for this batch
-            # We fetch backwards-ish by adjusting 'since' or just fetching and filtering?
-            # CCXT fetch_ohlcv usually fetches forward from 'since'.
-            # To get the LAST 'limit' candles ending at 'end_date', we need to calculate the start.
-            
-            duration_ms = remaining * 60 * 60 * 1000
-            since = end_ts - duration_ms
-            
-            # Safety check to ensure we don't get stuck
-            if len(all_ohlcv) > 0 and since >= all_ohlcv[-1][0]:
-                 break
-                 
-            ohlcv = await exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=fetch_limit)
-            
-            if not ohlcv:
-                break
-                
-            all_ohlcv.extend(ohlcv)
-            remaining -= len(ohlcv)
-            
-            # Update end_ts for next batch (though we are calculating 'since' from the original end)
-            # Actually, simpler approach: Calculate strict Start Time for the whole block
-            # and fetch forward from there.
-            
-        # Re-do with simpler forward-fetch logic
-        # 1. Calculate Start Time
-        total_duration_ms = limit * 60 * 60 * 1000
-        start_ts = end_ts - total_duration_ms
-        
-        all_ohlcv = []
-        current_since = start_ts
-        
-        while len(all_ohlcv) < limit:
-            fetch_limit = min(limit - len(all_ohlcv), 1000)
-            ohlcv = await exchange.fetch_ohlcv(symbol, timeframe, since=current_since, limit=fetch_limit)
-            
-            if not ohlcv:
-                break
-                
-            all_ohlcv.extend(ohlcv)
-            current_since = ohlcv[-1][0] + 1 # Next candle timestamp
-            
-            print(f"Fetched {len(all_ohlcv)} / {limit} candles...", end='\r')
-            
-        df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.set_index('timestamp', inplace=True)
-        
-        # Filter to ensure we don't go past end_date
-        if end_date:
-             end_dt = pd.to_datetime(end_date)
-             df = df[df.index <= end_dt]
-             
-        return df
-    finally:
-        await exchange.close()
+from src.data import fetch_historical_data, generate_synthetic_data
 
 def calculate_features(data_window: pd.Series):
     """
@@ -262,6 +166,64 @@ def walk_forward_optimization(data: pd.DataFrame, train_window_days: int = 30, t
             
     return pd.DataFrame(results)
 
+def run_static_backtest(data: pd.DataFrame, model_path: str):
+    """
+    Run backtest using a pre-trained model (No re-training).
+    """
+    print(f"Starting Static Backtest with model: {model_path}")
+    strategy = SignalGenerator()
+    strategy.load_model(model_path)
+    
+    results = []
+    lookback_buffer = 500
+    
+    # Loop through data
+    # We start after lookback_buffer
+    
+    start_idx = lookback_buffer
+    if start_idx >= len(data):
+        print("Data too short for lookback buffer.")
+        return pd.DataFrame()
+        
+    for j in range(start_idx, len(data)):
+        current_time = data.index[j]
+        
+        # Get history window
+        hist_start = max(0, j - lookback_buffer)
+        history_window = data['close'].iloc[hist_start : j + 1]
+        
+        # Calculate features
+        current_feat_row = calculate_features(history_window)
+        
+        if current_feat_row.empty:
+            continue
+            
+        # Predict
+        ml_features = current_feat_row[['velocity', 'acceleration', 'amplitude', 'phase', 'fracdiff']]
+        prob = strategy.predict_signal(ml_features)
+        
+        # Metrics
+        acc = current_feat_row['acceleration'].iloc[0]
+        hurst = current_feat_row['hurst'].iloc[0] if 'hurst' in current_feat_row else 0.5
+        entropy = current_feat_row['entropy'].iloc[0] if 'entropy' in current_feat_row else 0.0
+        
+        regime_action = strategy.regime_filter(entropy, hurst)
+        trigger = strategy.get_trigger(regime_action, hurst, acc, prob)
+        leverage = strategy.get_leverage(prob, hurst)
+        
+        results.append({
+            'timestamp': current_time,
+            'price': data['close'].iloc[j],
+            'trigger': trigger,
+            'prob': prob,
+            'leverage': leverage
+        })
+        
+        if j % 100 == 0:
+            print(f"Processed {j}/{len(data)} candles...", end='\r')
+            
+    return pd.DataFrame(results)
+
 def save_trade_log(results: pd.DataFrame, filename='results/trade_log.csv'):
     """
     Save trade log to CSV.
@@ -389,6 +351,7 @@ if __name__ == "__main__":
     parser.add_argument('--real', action='store_true', help='Use real historical data instead of synthetic')
     parser.add_argument('--limit', type=int, default=2000, help='Number of historical candles to fetch (default: 2000)')
     parser.add_argument('--end', type=str, help='End date for backtest (YYYY-MM-DD). Default: Now')
+    parser.add_argument('--model_path', type=str, help='Path to pre-trained model (e.g., models/xgb_model.json). If set, skips WFO.')
     args = parser.parse_args()
 
     data_source = "Synthetic (Random Walk)"
@@ -405,8 +368,11 @@ if __name__ == "__main__":
     print(f"Timeframe: {df.index[0]} to {df.index[-1]}")
     print(f"Duration:  {df.index[-1] - df.index[0]}")
     
-    # 2. Walk-Forward
-    results = walk_forward_optimization(df)
+    # 2. Backtest
+    if args.model_path:
+        results = run_static_backtest(df, args.model_path)
+    else:
+        results = walk_forward_optimization(df)
     
     if not results.empty:
         results.set_index('timestamp', inplace=True)
@@ -419,6 +385,11 @@ if __name__ == "__main__":
     print(f"Total Return: {total_return:.2%}")
 
     # Visualization
+    if returns.empty:
+        print("No returns to visualize.")
+        import sys
+        sys.exit(0)
+
     starting_capital = 100.0
     equity_curve = starting_capital * (1 + returns).cumprod()
     ending_capital = equity_curve.iloc[-1]

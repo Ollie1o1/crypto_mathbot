@@ -9,10 +9,12 @@ cryptoLEV/
 ├── src/                # Core source code
 │   ├── features.py     # Math & Physics feature engineering
 │   ├── strategy.py     # Signal generation & ML logic
-│   └── execution.py    # Order management & risk control
+│   ├── execution.py    # Order management & risk control
+│   └── data.py         # Data fetching & generation
 ├── results/            # Backtest reports, logs, and charts
 ├── logs/               # Application logs
 ├── main.py             # Live trading entry point
+├── train_model.py      # Model training script
 ├── validate_strategy.py # Backtesting & Validation script
 ├── requirements.txt    # Python dependencies
 └── README.md           # Documentation
@@ -61,8 +63,26 @@ cryptoLEV/
 ### 1. Configuration
 Configure your API keys in a `.env` file (optional for backtesting, required for live trading).
 
-### 2. Backtesting & Validation
-Run the validation script to test the strategy on real historical data. You can specify how far back to go using the `--limit` argument (number of hours).
+### 2. Workflow: Train -> Save -> Validate (Recommended)
+
+To avoid re-training on every run and to ensure consistent results, use the **Train-Save-Load** workflow.
+
+**Step 1: Train the Model**
+Fetch historical data, train the XGBoost model, and save it.
+```bash
+# Train on 5000 hours of real data
+python train_model.py --symbol "BTC/USDT" --limit 5000 --save_path "models/xgb_v1.json"
+```
+
+**Step 2: Validate the Model**
+Load the saved model and test it on a different (or same) dataset.
+```bash
+# Validate on the last 2000 hours using the saved model
+python validate_strategy.py --real --limit 2000 --model_path "models/xgb_v1.json"
+```
+
+### 3. Quick Backtest (Walk-Forward)
+Run the validation script directly to perform a Walk-Forward Optimization (Train/Test rolling window) on the fly.
 
 ```bash
 # Default (2000 hours ~ 83 days)
@@ -86,7 +106,7 @@ python validate_strategy.py --limit 5000
         3.  **AI Confidence is High** (> 65%)
     - If conditions aren't perfect, it stays in **CASH** to prevent ruin.
 
-### 3. Live Trading
+### 4. Live Trading
 Run the main bot to start the training and execution loop:
 ```bash
 python main.py

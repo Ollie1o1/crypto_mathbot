@@ -12,6 +12,20 @@ class CryptoKinematics:
     def __init__(self):
         pass
 
+    def generate_all_features(self, close: pd.Series) -> pd.DataFrame:
+        """
+        Generate all features for the entire series.
+        """
+        smooth_price = self.get_smooth_price(close)
+        kinematics = self.get_kinematics(smooth_price)
+        dsp = self.get_dsp_features(close)
+        regime = self.get_regime_features(close)
+        fracdiff = self.get_fracdiff(close)
+        
+        # Combine
+        features = pd.concat([kinematics, dsp, regime, fracdiff.rename('fracdiff')], axis=1)
+        return features
+
     def get_smooth_price(self, close: pd.Series, window_length: int = 11, polyorder: int = 2) -> pd.Series:
         """
         Apply a Savitzky-Golay Filter to the Close price to remove noise.

@@ -18,6 +18,21 @@ class SignalGenerator:
         )
         self.is_trained = False
 
+    def save_model(self, filepath: str):
+        """
+        Save the trained XGBoost model to a file.
+        """
+        self.model.save_model(filepath)
+        print(f"Model saved to {filepath}")
+
+    def load_model(self, filepath: str):
+        """
+        Load a trained XGBoost model from a file.
+        """
+        self.model.load_model(filepath)
+        self.is_trained = True
+        print(f"Model loaded from {filepath}")
+
     def regime_filter(self, entropy: float, hurst: float, entropy_threshold: float = 0.95) -> str:
         """
         Layer 1: Regime Filter (Hard Rules).
@@ -110,12 +125,14 @@ class SignalGenerator:
         leverage = 1.0
         
         # High Confidence Bonus
-        if probability > 0.75:
-            leverage += 1.0
+        if probability > 0.80:
+            leverage += 1.5
+        elif probability > 0.70:
+            leverage += 0.5
             
         # Strong Trend Bonus
-        if hurst > 0.65:
+        if hurst > 0.70:
             leverage += 1.0
             
-        # Cap leverage at 3x for safety
-        return min(leverage, 3.0)
+        # Cap leverage at 4x for high conviction
+        return min(leverage, 4.0)
