@@ -101,9 +101,22 @@ class SignalGenerator:
             if acceleration < 0 and ml_prob < 0.35:
                 return 'SHORT'
                 
-        # Mean Reverting Logic (Optional extension based on prompt implying Trade Grid/Counter-trend)
-        # Prompt only specified triggers for Trending Regime explicitly in "Layer 3: Trigger Logic" section.
-        # "Execute LONG if: Regime is Trending... Execute SHORT if: Regime is Trending..."
-        # So we will stick to that for now.
-        
         return 'HOLD'
+
+    def get_leverage(self, probability: float, hurst: float) -> float:
+        """
+        Calculate dynamic leverage based on conviction.
+        """
+        # Base leverage
+        leverage = 1.0
+        
+        # High Confidence Bonus
+        if probability > 0.75:
+            leverage += 1.0
+            
+        # Strong Trend Bonus
+        if hurst > 0.65:
+            leverage += 1.0
+            
+        # Cap leverage at 3x for safety
+        return min(leverage, 3.0)

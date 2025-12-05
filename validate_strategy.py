@@ -7,13 +7,20 @@ import ccxt.async_support as ccxt
 import asyncio
 import argparse
 import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
 
-def generate_synthetic_data(hours=2000):
+def generate_synthetic_data(hours=2000, end_date=None):
     """
     Generate synthetic OHLCV data for testing.
     """
     print(f"Generating {hours} hours of Synthetic Data (Random Walk)...")
-    dates = pd.date_range(start='2024-01-01', periods=hours, freq='h')
+    
+    if end_date:
+        end = pd.to_datetime(end_date)
+    else:
+        end = pd.Timestamp.now()
+        
+    dates = pd.date_range(end=end, periods=hours, freq='h')
     # Add a slight positive drift to make it "too good" like the user saw
     drift = 0.0001
     returns = np.random.randn(len(dates)) * 0.01 + drift
@@ -21,14 +28,24 @@ def generate_synthetic_data(hours=2000):
     df = pd.DataFrame({'close': price}, index=dates)
     return df
 
-async def fetch_historical_data(symbol='BTC/USDT', timeframe='1h', limit=1000):
+async def fetch_historical_data(symbol='BTC/USDT', timeframe='1h', limit=1000, end_date=None):
     """
     Fetch real historical OHLCV data from Binance.
     """
     print(f"Fetching {limit} candles of real data for {symbol}...")
     exchange = ccxt.binance()
     try:
-        ohlcv = await exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        since = None
+        if end_date:
+            # Calculate 'since' based on end_date and limit
+            # This is an approximation, as we can't know exact candle counts with gaps
+            # But for 1h candles on Binance, it's usually reliable
+            end_ts = int(pd.to_datetime(end_date).timestamp() * 1000)
+            duration_ms = limit * 60 * 60 * 1000
+            since = end_ts - duration_ms
+            print(f"Targeting data ending around {end_date} (Since: {since})")
+
+        ohlcv = await exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('timestamp', inplace=True)
@@ -87,12 +104,14 @@ def walk_forward_optimization(data: pd.DataFrame, train_window_days: int = 30, t
             
             regime_action = strategy.regime_filter(entropy, hurst)
             trigger = strategy.get_trigger(regime_action, hurst, acc, prob)
+            leverage = strategy.get_leverage(prob, hurst)
             
             results.append({
                 'timestamp': idx,
                 'price': test_price.iloc[j],
                 'trigger': trigger,
-                'prob': prob
+                'prob': prob,
+                'leverage': leverage
             })
             
     return pd.DataFrame(results)
@@ -120,21 +139,21 @@ def save_trade_log(results: pd.DataFrame, filename='results/trade_log.csv'):
             trades.append({
                 'Entry Time': entry_time,
                 'Exit Time': curr_row['timestamp'],
-                'Type': 'LONG' if position == 1 else 'SHORT',
+                'Type': 'LONG' if position > 0 else 'SHORT',
                 'Entry Price': entry_price,
                 'Exit Price': exit_price,
-                'Leverage': '1x',
+                'Leverage': f"{abs(position)}x",
                 'PnL': pnl
             })
             position = 0
             
         # Open position
         if prev_row['trigger'] == 'LONG':
-            position = 1
+            position = prev_row['leverage']
             entry_price = curr_row['price']
             entry_time = curr_row['timestamp']
         elif prev_row['trigger'] == 'SHORT':
-            position = -1
+            position = -prev_row['leverage']
             entry_price = curr_row['price']
             entry_time = curr_row['timestamp']
             
@@ -190,17 +209,21 @@ def calculate_metrics(results: pd.DataFrame):
         # Close position
         if position != 0:
             ret = (curr_row['price'] - entry_price) / entry_price
-            if position == -1:
+            if position < 0:
                 ret = -ret
+            
+            # Apply Leverage
+            ret = ret * abs(position)
+            
             results.loc[curr_row.name, 'return'] = ret
             position = 0 # Simple 1-step hold for testing
             
         # Open position
         if prev_row['trigger'] == 'LONG':
-            position = 1
+            position = prev_row['leverage']
             entry_price = curr_row['price']
         elif prev_row['trigger'] == 'SHORT':
-            position = -1
+            position = -prev_row['leverage']
             entry_price = curr_row['price']
             
     returns = results['return']
@@ -219,18 +242,19 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Validate Strategy')
     parser.add_argument('--real', action='store_true', help='Use real historical data instead of synthetic')
     parser.add_argument('--limit', type=int, default=2000, help='Number of historical candles to fetch (default: 2000)')
+    parser.add_argument('--end', type=str, help='End date for backtest (YYYY-MM-DD). Default: Now')
     args = parser.parse_args()
 
     data_source = "Synthetic (Random Walk)"
     if args.real:
         data_source = "Real Market (Binance BTC/USDT)"
         # 1. Fetch Real Data
-        df = asyncio.run(fetch_historical_data(limit=args.limit))
+        df = asyncio.run(fetch_historical_data(limit=args.limit, end_date=args.end))
         print(f"\n--- Backtest Results ({data_source}: {args.limit} candles) ---")
     else:
         # 1. Generate Synthetic Data
         print(f"\n--- Backtest Results ({data_source}) ---")
-        df = generate_synthetic_data(hours=args.limit)
+        df = generate_synthetic_data(hours=args.limit, end_date=args.end)
     
     print(f"Timeframe: {df.index[0]} to {df.index[-1]}")
     print(f"Duration:  {df.index[-1] - df.index[0]}")
@@ -252,7 +276,7 @@ if __name__ == "__main__":
     
     print(f"\n--- Account Summary ---")
     print(f"Data Source:      {data_source}")
-    print(f"Leverage Used:    1x (Simulated)")
+    print(f"Leverage Used:    Dynamic (1x - 3x)")
     print(f"Starting Capital: ${starting_capital:.2f}")
     print(f"Ending Capital:   ${ending_capital:.2f}")
     print(f"Net Profit:       ${ending_capital - starting_capital:.2f}")
