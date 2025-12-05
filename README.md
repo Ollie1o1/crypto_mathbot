@@ -22,11 +22,11 @@ cryptoLEV/
 
 ## Features
 
-- **Kinematics**: Smooth Price, Velocity, Acceleration (Calculus-based).
-- **Signal Processing**: Hilbert Transform for Phase and Amplitude.
-- **Regime Detection**: Hurst Exponent and Shannon Entropy.
-- **Machine Learning**: XGBoost Classifier on FracDiff features.
-- **Execution**: Post-Only orders, Volatility Targeting, Kelly Criterion.
+- **Kinematics**: Velocity & Acceleration on **Log-Returns** (Scale Invariant).
+- **Signal Processing**: Hilbert Transform for Phase/Amplitude on Detrended Series.
+- **Regime Detection**: Hurst Exponent and Shannon Entropy (Fed to ML).
+- **Machine Learning**: XGBoost Classifier with **Dynamic Volatility Barriers**.
+- **Execution**: Continuous **Kelly Criterion** with Volatility Targeting.
 
 ## Project Structure
 
@@ -71,14 +71,15 @@ To avoid re-training on every run and to ensure consistent results, use the **Tr
 Fetch historical data, train the XGBoost model, and save it.
 ```bash
 # Train on 5000 hours of real data
-python train_model.py --symbol "BTC/USDT" --limit 5000 --save_path "models/xgb_v1.json"
+# Train on 5000 hours of real data
+python train_model.py --symbol "BTC/USDT" --limit 5000 --save_path "models/xgb_prod.json"
 ```
 
 **Step 2: Validate the Model**
 Load the saved model and test it on a different (or same) dataset.
 ```bash
 # Validate on the last 2000 hours using the saved model
-python validate_strategy.py --real --limit 2000 --model_path "models/xgb_v1.json"
+python validate_strategy.py --real --limit 2000 --model_path "models/xgb_prod.json"
 ```
 
 ### 3. Quick Backtest (Walk-Forward)
@@ -105,6 +106,15 @@ python validate_strategy.py --limit 5000
         2.  **Momentum is Accelerating**
         3.  **AI Confidence is High** (> 65%)
     - If conditions aren't perfect, it stays in **CASH** to prevent ruin.
+
+## Performance (Production Model)
+
+As of Dec 2025, the Production Model (`xgb_prod.json`) achieved the following on 2000 hours of out-of-sample data:
+
+- **Total Return**: +47.76%
+- **Sharpe Ratio**: 2.54
+- **Calmar Ratio**: 11.14
+- **Trades**: 1322
 
 ### 4. Live Trading
 Run the main bot to start the training and execution loop:

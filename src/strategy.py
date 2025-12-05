@@ -1,11 +1,15 @@
 import pandas as pd
 import numpy as np
 from xgboost import XGBClassifier
-from sklearn.model_selection import train_test_split
 
 class SignalGenerator:
     """
-    Decision Engine combining Regime Filtering, ML Classification, and Trigger Logic.
+    Decision Engine combining ML Classification and Kelly Criterion.
+    
+    Refactored for Production:
+    - Dynamic Volatility Barriers (Triple Barrier Method)
+    - Removed Hardcoded Regime Filters (ML learns them)
+    - Continuous Kelly Criterion for Sizing
     """
     
     def __init__(self):
@@ -19,54 +23,49 @@ class SignalGenerator:
         self.is_trained = False
 
     def save_model(self, filepath: str):
-        """
-        Save the trained XGBoost model to a file.
-        """
         self.model.save_model(filepath)
         print(f"Model saved to {filepath}")
 
     def load_model(self, filepath: str):
-        """
-        Load a trained XGBoost model from a file.
-        """
         self.model.load_model(filepath)
         self.is_trained = True
         print(f"Model loaded from {filepath}")
 
-    def regime_filter(self, entropy: float, hurst: float, entropy_threshold: float = 0.95) -> str:
-        """
-        Layer 1: Regime Filter (Hard Rules).
-        Returns 'TRADE' or 'HOLD'.
-        """
-        # If High Entropy (Chaotic) or Random Walk (Hurst ~ 0.5), stay cash.
-        # Relaxed thresholds to allow more trading during testing.
-        
-        if entropy > entropy_threshold:
-            return 'HOLD'
-        
-        if 0.48 <= hurst <= 0.52:
-            return 'HOLD'
-            
-        return 'TRADE'
-
-    def prepare_features(self, kinematics: pd.DataFrame, dsp: pd.DataFrame, fracdiff: pd.Series) -> pd.DataFrame:
+    def prepare_features(self, kinematics: pd.DataFrame, dsp: pd.DataFrame, fracdiff: pd.Series, regime: pd.DataFrame) -> pd.DataFrame:
         """
         Combine features for the ML model.
+        Now includes Regime features (Hurst, Entropy) so the model can learn them.
         """
-        features = pd.concat([kinematics, dsp, fracdiff.rename('fracdiff')], axis=1)
+        features = pd.concat([kinematics, dsp, fracdiff.rename('fracdiff'), regime], axis=1)
         return features.dropna()
 
-    def train_model(self, features: pd.DataFrame, price: pd.Series, time_horizon: int = 12, barrier: float = 0.01):
+    def train_model(self, features: pd.DataFrame, price: pd.Series, time_horizon: int = 12, barrier_multiplier: float = 2.0):
         """
-        Train the XGBoost Classifier using Triple Barrier Method labeling.
+        Train using Dynamic Triple Barrier Method.
+        Barrier Width = Daily Volatility * Multiplier
         """
-        # Create Labels
-        # Label 1 if price hits upper barrier before lower barrier within time_horizon
-        # Label 0 otherwise
+        # Calculate Volatility (Standard Deviation of Returns)
+        returns = price.pct_change()
+        volatility = returns.rolling(window=24).std() # 24-hour volatility
         
         labels = []
+        valid_indices = []
+        
+        # Align indices
+        common_idx = features.index.intersection(price.index).intersection(volatility.index)
+        features = features.loc[common_idx]
+        price = price.loc[common_idx]
+        volatility = volatility.loc[common_idx]
+        
         for i in range(len(price) - time_horizon):
             current_price = price.iloc[i]
+            current_vol = volatility.iloc[i]
+            
+            if pd.isna(current_vol) or current_vol == 0:
+                continue
+                
+            # Dynamic Barrier
+            barrier = current_vol * barrier_multiplier
             upper = current_price * (1 + barrier)
             lower = current_price * (1 - barrier)
             
@@ -77,62 +76,63 @@ class SignalGenerator:
             
             if pd.notna(hit_upper) and (pd.isna(hit_lower) or hit_upper < hit_lower):
                 labels.append(1)
-            else:
+                valid_indices.append(features.index[i])
+            elif pd.notna(hit_lower) and (pd.isna(hit_upper) or hit_lower < hit_upper):
                 labels.append(0)
+                valid_indices.append(features.index[i])
+            else:
+                # Timed out (Vertical Barrier) - Label 0 (or ignore)
+                # For binary classification, we treat timeout as "No Trade" or 0
+                labels.append(0)
+                valid_indices.append(features.index[i])
                 
         # Align features with labels
-        X = features.iloc[:len(labels)]
+        X = features.loc[valid_indices]
         y = np.array(labels)
         
-        # Train
+        print(f"Training on {len(X)} samples with Dynamic Barriers...")
         self.model.fit(X, y)
         self.is_trained = True
 
     def predict_signal(self, current_features: pd.DataFrame) -> float:
         """
-        Layer 2: ML Classifier Output.
         Returns probability of hitting upper barrier.
         """
         if not self.is_trained:
-            return 0.5 # Neutral if not trained
+            return 0.5
             
-        # Expecting a single row dataframe
         prob = self.model.predict_proba(current_features)[:, 1][0]
         return prob
 
-    def get_trigger(self, regime_action: str, hurst: float, acceleration: float, ml_prob: float) -> str:
+    def get_leverage(self, probability: float, volatility: float, target_vol: float = 0.05, max_leverage: float = 4.0) -> float:
         """
-        Layer 3: Trigger Logic.
-        Returns 'LONG', 'SHORT', or 'HOLD'.
-        """
-        if regime_action == 'HOLD':
-            return 'HOLD'
-            
-        # Trending Regime Logic
-        if hurst > 0.55:
-            if acceleration > 0 and ml_prob > 0.65:
-                return 'LONG'
-            if acceleration < 0 and ml_prob < 0.35:
-                return 'SHORT'
-                
-        return 'HOLD'
-
-    def get_leverage(self, probability: float, hurst: float) -> float:
-        """
-        Calculate dynamic leverage based on conviction.
-        """
-        # Base leverage
-        leverage = 1.0
+        Continuous Kelly Criterion with Volatility Targeting.
         
-        # High Confidence Bonus
-        if probability > 0.80:
-            leverage += 1.5
-        elif probability > 0.70:
-            leverage += 0.5
+        1. Kelly Fraction = (p - q) / 1 (assuming 1:1 odds for simplicity, or 2p-1)
+           Refined: 2 * Probability - 1
+        2. Volatility Scalar = Target_Vol / Current_Vol
+        3. Leverage = Kelly * Scalar * Capital_Factor (0.5 for Half-Kelly)
+        """
+        # 1. Kelly Fraction (Directional Conviction)
+        # Prob > 0.5 -> Long, Prob < 0.5 -> Short
+        # We return signed leverage to indicate direction
+        
+        raw_kelly = 2 * probability - 1 # Range [-1, 1]
+        
+        # Filter weak signals
+        if abs(raw_kelly) < 0.1: # Equivalent to Prob between 0.45 and 0.55
+            return 0.0
             
-        # Strong Trend Bonus
-        if hurst > 0.70:
-            leverage += 1.0
+        # 2. Volatility Scalar
+        if volatility <= 0:
+            vol_scalar = 1.0
+        else:
+            vol_scalar = target_vol / volatility
             
-        # Cap leverage at 4x for high conviction
-        return min(leverage, 4.0)
+        # 3. Final Leverage (Half-Kelly for safety)
+        leverage = raw_kelly * vol_scalar * 0.5
+        
+        # Cap leverage
+        leverage = np.clip(leverage, -max_leverage, max_leverage)
+        
+        return leverage

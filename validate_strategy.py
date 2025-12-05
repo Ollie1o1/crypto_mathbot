@@ -20,30 +20,14 @@ def calculate_features(data_window: pd.Series):
     """
     kinematics = CryptoKinematics()
     
-    # 1. Smooth Price (EMA is causal, but we calc on window to be safe)
-    smooth_price = kinematics.get_smooth_price(data_window)
+    # 1. Generate All Features (Batch)
+    # Since we are inside a loop or helper, we might be calling this on a window.
+    # The new 'generate_all_features' handles everything including normalization.
     
-    # 2. Kinematics
-    kin_feats = kinematics.get_kinematics(smooth_price)
+    features = kinematics.generate_all_features(data_window)
     
-    # 3. DSP (Hilbert) - Calc on window, take last
-    dsp_feats = kinematics.get_dsp_features(data_window)
-    
-    # 4. Regime
-    regime_feats = kinematics.get_regime_features(data_window)
-    
-    # 5. FracDiff
-    fracdiff = kinematics.get_fracdiff(data_window)
-    
-    # Combine
-    # Note: prepare_features concatenates. We need to handle the fact that
-    # some features (like diff) introduce NaNs at the start of the window.
-    # We only care about the LAST row (current time).
-    
-    # Manually combine to ensure we get the last row even if earlier ones are NaN
-    df = pd.concat([kin_feats, dsp_feats, regime_feats, fracdiff.rename('fracdiff')], axis=1)
-    
-    return df.iloc[[-1]] # Return as 1-row DataFrame
+    # Return the last row
+    return features.iloc[[-1]]
 
 def walk_forward_optimization(data: pd.DataFrame, train_window_days: int = 30, test_window_days: int = 7):
     """
@@ -89,14 +73,9 @@ def walk_forward_optimization(data: pd.DataFrame, train_window_days: int = 30, t
         train_data_buffered = data['close'].iloc[buffer_start : train_end_idx]
         
         # Calculate features on buffered data
+        # Calculate features on buffered data
         kinematics = CryptoKinematics()
-        smooth_p = kinematics.get_smooth_price(train_data_buffered)
-        kin_f = kinematics.get_kinematics(smooth_p)
-        dsp_f = kinematics.get_dsp_features(train_data_buffered)
-        reg_f = kinematics.get_regime_features(train_data_buffered)
-        fd_f = kinematics.get_fracdiff(train_data_buffered)
-        
-        train_feats_all = strategy.prepare_features(kin_f, dsp_f, fd_f)
+        train_feats_all = kinematics.generate_all_features(train_data_buffered)
         
         # Trim buffer to get actual training set
         # We need to align indices
@@ -140,25 +119,30 @@ def walk_forward_optimization(data: pd.DataFrame, train_window_days: int = 30, t
                 raise ValueError(f"CRITICAL: Future Data Leak! Feature Time {feat_time} > Current Time {current_time}")
             
             # Predict
-            # Filter columns to match training data (exclude regime features)
-            ml_features = current_feat_row[['velocity', 'acceleration', 'amplitude', 'phase', 'fracdiff']]
-            prob = strategy.predict_signal(ml_features)
+            # Predict
+            # Use all features available
+            prob = strategy.predict_signal(current_feat_row)
             
-            # Get other metrics
-            acc = current_feat_row['acceleration'].iloc[0]
-            hurst = current_feat_row['hurst'].iloc[0] if 'hurst' in current_feat_row else 0.5
-            entropy = current_feat_row['entropy'].iloc[0] if 'entropy' in current_feat_row else 0.0
+            # Calculate Volatility for Kelly
+            # Simple 24h rolling std of returns
+            returns = history_window.pct_change()
+            volatility = returns.iloc[-24:].std() if len(returns) >= 24 else 0.01
             
-            regime_action = strategy.regime_filter(entropy, hurst)
-            trigger = strategy.get_trigger(regime_action, hurst, acc, prob)
-            leverage = strategy.get_leverage(prob, hurst)
+            # Get Leverage (Signed)
+            leverage = strategy.get_leverage(prob, volatility)
             
+            trigger = 'HOLD'
+            if leverage > 0:
+                trigger = 'LONG'
+            elif leverage < 0:
+                trigger = 'SHORT'
+                
             results.append({
                 'timestamp': current_time,
                 'price': data['close'].iloc[j],
                 'trigger': trigger,
                 'prob': prob,
-                'leverage': leverage
+                'leverage': abs(leverage)
             })
             
         step_counter += 1
@@ -199,24 +183,28 @@ def run_static_backtest(data: pd.DataFrame, model_path: str):
             continue
             
         # Predict
-        ml_features = current_feat_row[['velocity', 'acceleration', 'amplitude', 'phase', 'fracdiff']]
-        prob = strategy.predict_signal(ml_features)
+        # Predict
+        prob = strategy.predict_signal(current_feat_row)
         
-        # Metrics
-        acc = current_feat_row['acceleration'].iloc[0]
-        hurst = current_feat_row['hurst'].iloc[0] if 'hurst' in current_feat_row else 0.5
-        entropy = current_feat_row['entropy'].iloc[0] if 'entropy' in current_feat_row else 0.0
+        # Calculate Volatility for Kelly
+        returns = history_window.pct_change()
+        volatility = returns.iloc[-24:].std() if len(returns) >= 24 else 0.01
         
-        regime_action = strategy.regime_filter(entropy, hurst)
-        trigger = strategy.get_trigger(regime_action, hurst, acc, prob)
-        leverage = strategy.get_leverage(prob, hurst)
+        # Get Leverage (Signed)
+        leverage = strategy.get_leverage(prob, volatility)
         
+        trigger = 'HOLD'
+        if leverage > 0:
+            trigger = 'LONG'
+        elif leverage < 0:
+            trigger = 'SHORT'
+            
         results.append({
             'timestamp': current_time,
             'price': data['close'].iloc[j],
             'trigger': trigger,
             'prob': prob,
-            'leverage': leverage
+            'leverage': abs(leverage)
         })
         
         if j % 100 == 0:

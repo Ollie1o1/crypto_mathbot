@@ -28,7 +28,8 @@ async def main():
     
     # Select features used by the ML model
     # Note: Ensure these match exactly what's used in predict_signal
-    ml_features = features[['velocity', 'acceleration', 'amplitude', 'phase', 'fracdiff']].dropna()
+    # All features from generate_all_features are now used (including hurst/entropy)
+    ml_features = features.dropna()
     
     # Align price with features
     valid_indices = ml_features.index
