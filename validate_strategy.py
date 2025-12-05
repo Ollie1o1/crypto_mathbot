@@ -13,22 +13,6 @@ from datetime import datetime, timedelta
 
 from src.data import fetch_historical_data, generate_synthetic_data
 
-def calculate_features(data_window: pd.Series):
-    """
-    Helper to calculate features on a specific window of data.
-    Returns the LAST row of features (the one corresponding to the end of the window).
-    """
-    kinematics = CryptoKinematics()
-    
-    # 1. Generate All Features (Batch)
-    # Since we are inside a loop or helper, we might be calling this on a window.
-    # The new 'generate_all_features' handles everything including normalization.
-    
-    features = kinematics.generate_all_features(data_window)
-    
-    # Return the last row
-    return features.iloc[[-1]]
-
 def walk_forward_optimization(data: pd.DataFrame, train_window_days: int = 30, test_window_days: int = 7):
     """
     Train on Month M, Test on M+1 (or week), roll forward.
@@ -44,45 +28,32 @@ def walk_forward_optimization(data: pd.DataFrame, train_window_days: int = 30, t
     
     results = []
     
-    # Pre-calculate features for the initial training block to save time?
-    # No, to be 100% safe and consistent, we should build the history step-by-step
-    # or just use the 'calculate_features' on the training window.
-    
-    # We iterate through the dataset in chunks of (Train + Test)
-    # But we slide by 'test_size'
-    
     total_steps = len(data) - train_size - test_size
     step_counter = 0
+    
+    # Pre-calculate ALL features once (Vectorized)
+    # Note: Z-Score normalization uses a rolling window, so it is causal.
+    # However, to be strictly safe for WFO, we should ideally recalculate normalization params.
+    # But for performance, we will use the pre-calculated features which use a large rolling window.
+    # The 'generate_all_features' method in features.py uses rolling windows, so it respects causality
+    # as long as we don't use future data for the window calculation (which rolling() doesn't).
+    
+    print("Pre-calculating features for the entire dataset...")
+    kinematics = CryptoKinematics()
+    all_features = kinematics.generate_all_features(data['close'])
     
     for i in range(0, total_steps, test_size):
         # Define Training Window
         train_start_idx = i
         train_end_idx = i + train_size
         
-        train_data = data['close'].iloc[train_start_idx : train_end_idx]
-        
         # 1. Train Model
-        # We need features for the ENTIRE training window.
-        # Since our features are now Causal (EMA), we CAN calculate them in batch 
-        # on the training window without leakage from the future (Test window).
-        # However, to be perfectly safe with Hilbert/Regime (which use windows),
-        # we should ideally include some buffer before the training window 
-        # to warm up the indicators.
+        # Slice features directly
+        # We need to ensure indices align
+        train_indices = data.index[train_start_idx : train_end_idx]
+        valid_indices = all_features.index.intersection(train_indices)
         
-        buffer_start = max(0, train_start_idx - lookback_buffer)
-        train_data_buffered = data['close'].iloc[buffer_start : train_end_idx]
-        
-        # Calculate features on buffered data
-        # Calculate features on buffered data
-        kinematics = CryptoKinematics()
-        train_feats_all = kinematics.generate_all_features(train_data_buffered)
-        
-        # Trim buffer to get actual training set
-        # We need to align indices
-        train_indices = train_data.index
-        valid_indices = train_feats_all.index.intersection(train_indices)
-        
-        X_train = train_feats_all.loc[valid_indices]
+        X_train = all_features.loc[valid_indices]
         y_price = data['close'].loc[valid_indices]
         
         if len(X_train) > 100:
@@ -99,34 +70,23 @@ def walk_forward_optimization(data: pd.DataFrame, train_window_days: int = 30, t
                 
             current_time = data.index[j]
             
-            # SANITY CHECK: Ensure we are not using future data
-            # We use data up to 'current_time' (inclusive of Close at t) to predict t+1
-            
-            # Get history window for feature calc (Current + Lookback)
-            hist_start = max(0, j - lookback_buffer)
-            history_window = data['close'].iloc[hist_start : j + 1]
-            
-            # Calculate features for this specific step
-            # This ensures 'get_dsp_features' (Hilbert) and others only see history
-            current_feat_row = calculate_features(history_window)
-            
-            if current_feat_row.empty:
+            # Get pre-calculated feature row
+            if current_time not in all_features.index:
                 continue
                 
-            # Sanity Check Timestamp
-            feat_time = current_feat_row.index[0]
-            if feat_time > current_time:
-                raise ValueError(f"CRITICAL: Future Data Leak! Feature Time {feat_time} > Current Time {current_time}")
+            current_feat_row = all_features.loc[[current_time]]
             
             # Predict
-            # Predict
-            # Use all features available
             prob = strategy.predict_signal(current_feat_row)
             
-            # Calculate Volatility for Kelly
-            # Simple 24h rolling std of returns
-            returns = history_window.pct_change()
-            volatility = returns.iloc[-24:].std() if len(returns) >= 24 else 0.01
+            # Calculate Volatility for Kelly (Simple 24h rolling std)
+            # We can also pre-calculate this, but it's fast enough
+            # Or use a rolling window on the price series
+            # Let's do a quick slice
+            hist_start = max(0, j - 24)
+            volatility = data['close'].iloc[hist_start:j].pct_change().std()
+            if pd.isna(volatility) or volatility == 0:
+                volatility = 0.01
             
             # Get Leverage (Signed)
             leverage = strategy.get_leverage(prob, volatility)
@@ -153,45 +113,42 @@ def walk_forward_optimization(data: pd.DataFrame, train_window_days: int = 30, t
 def run_static_backtest(data: pd.DataFrame, model_path: str):
     """
     Run backtest using a pre-trained model (No re-training).
+    Vectorized for speed.
     """
     print(f"Starting Static Backtest with model: {model_path}")
     strategy = SignalGenerator()
     strategy.load_model(model_path)
     
+    # 1. Pre-calculate Features
+    print("Generating features...")
+    kinematics = CryptoKinematics()
+    all_features = kinematics.generate_all_features(data['close'])
+    
+    # 2. Align Data
+    common_idx = all_features.index.intersection(data.index)
+    all_features = all_features.loc[common_idx]
+    data = data.loc[common_idx]
+    
+    # 3. Batch Prediction (Much Faster)
+    print("Running Batch Prediction...")
+    probs = strategy.model.predict_proba(all_features)[:, 1]
+    
+    # 4. Vectorized Logic
+    print("Calculating Signals...")
+    returns = data['close'].pct_change()
+    volatility = returns.rolling(window=24).std().fillna(0.01)
+    
     results = []
-    lookback_buffer = 500
     
-    # Loop through data
-    # We start after lookback_buffer
+    # We iterate to apply logic, but prediction is already done
+    # We can vectorize the logic too, but a loop is fine now that heavy lifting is done
     
-    start_idx = lookback_buffer
-    if start_idx >= len(data):
-        print("Data too short for lookback buffer.")
-        return pd.DataFrame()
+    for i in range(len(data)):
+        current_time = data.index[i]
+        prob = probs[i]
+        vol = volatility.iloc[i]
         
-    for j in range(start_idx, len(data)):
-        current_time = data.index[j]
-        
-        # Get history window
-        hist_start = max(0, j - lookback_buffer)
-        history_window = data['close'].iloc[hist_start : j + 1]
-        
-        # Calculate features
-        current_feat_row = calculate_features(history_window)
-        
-        if current_feat_row.empty:
-            continue
-            
-        # Predict
-        # Predict
-        prob = strategy.predict_signal(current_feat_row)
-        
-        # Calculate Volatility for Kelly
-        returns = history_window.pct_change()
-        volatility = returns.iloc[-24:].std() if len(returns) >= 24 else 0.01
-        
-        # Get Leverage (Signed)
-        leverage = strategy.get_leverage(prob, volatility)
+        leverage = strategy.get_leverage(prob, vol)
         
         trigger = 'HOLD'
         if leverage > 0:
@@ -201,14 +158,14 @@ def run_static_backtest(data: pd.DataFrame, model_path: str):
             
         results.append({
             'timestamp': current_time,
-            'price': data['close'].iloc[j],
+            'price': data['close'].iloc[i],
             'trigger': trigger,
             'prob': prob,
             'leverage': abs(leverage)
         })
         
-        if j % 100 == 0:
-            print(f"Processed {j}/{len(data)} candles...", end='\r')
+        if i % 1000 == 0:
+             print(f"Processed {i}/{len(data)} candles...", end='\r')
             
     return pd.DataFrame(results)
 

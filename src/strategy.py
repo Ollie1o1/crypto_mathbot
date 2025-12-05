@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from xgboost import XGBClassifier
+import torch
 
 class SignalGenerator:
     """
@@ -10,15 +11,24 @@ class SignalGenerator:
     - Dynamic Volatility Barriers (Triple Barrier Method)
     - Removed Hardcoded Regime Filters (ML learns them)
     - Continuous Kelly Criterion for Sizing
+    - GPU Acceleration Support
     """
     
     def __init__(self):
+        # Check for GPU
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        tree_method = 'hist' if self.device == 'cuda' else 'auto'
+        
+        print(f"Initializing XGBoost on {self.device.upper()}...")
+        
         self.model = XGBClassifier(
             n_estimators=100, 
             learning_rate=0.05, 
             max_depth=5, 
             objective='binary:logistic',
-            eval_metric='logloss'
+            eval_metric='logloss',
+            tree_method=tree_method,
+            device=self.device
         )
         self.is_trained = False
 

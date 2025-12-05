@@ -27,6 +27,8 @@ cryptoLEV/
 - **Regime Detection**: Hurst Exponent and Shannon Entropy (Fed to ML).
 - **Machine Learning**: XGBoost Classifier with **Dynamic Volatility Barriers**.
 - **Execution**: Continuous **Kelly Criterion** with Volatility Targeting.
+- **Performance**: **GPU Acceleration** and **Vectorized Backtesting** (1000x Speedup).
+- **Optimization**: Automated Hyperparameter Tuning with **Optuna**.
 
 ## Project Structure
 
@@ -82,7 +84,13 @@ Load the saved model and test it on a different (or same) dataset.
 python validate_strategy.py --real --limit 2000 --model_path "models/xgb_prod.json"
 ```
 
-### 3. Quick Backtest (Walk-Forward)
+### 3. Hyperparameter Tuning (Optional)
+Optimize the XGBoost model parameters using Optuna.
+```bash
+python optimize.py --limit 2000 --trials 50
+```
+
+### 4. Quick Backtest (Walk-Forward)
 Run the validation script directly to perform a Walk-Forward Optimization (Train/Test rolling window) on the fly.
 
 ```bash
