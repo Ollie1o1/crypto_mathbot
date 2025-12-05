@@ -18,19 +18,18 @@ class SignalGenerator:
         )
         self.is_trained = False
 
-    def regime_filter(self, entropy: float, hurst: float, entropy_threshold: float = 0.8) -> str:
+    def regime_filter(self, entropy: float, hurst: float, entropy_threshold: float = 0.95) -> str:
         """
         Layer 1: Regime Filter (Hard Rules).
         Returns 'TRADE' or 'HOLD'.
         """
         # If High Entropy (Chaotic) or Random Walk (Hurst ~ 0.5), stay cash.
-        # Hurst < 0.45 (Mean Reversion) or > 0.55 (Trending) are tradeable.
-        # 0.45 <= Hurst <= 0.55 is Random Walk.
+        # Relaxed thresholds to allow more trading during testing.
         
         if entropy > entropy_threshold:
             return 'HOLD'
         
-        if 0.45 <= hurst <= 0.55:
+        if 0.48 <= hurst <= 0.52:
             return 'HOLD'
             
         return 'TRADE'

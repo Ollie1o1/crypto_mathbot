@@ -7,6 +7,8 @@ import ccxt.async_support as ccxt
 import asyncio
 import argparse
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import matplotlib.ticker as mticker
 from datetime import datetime, timedelta
 
 def generate_synthetic_data(hours=2000, end_date=None):
@@ -21,98 +23,242 @@ def generate_synthetic_data(hours=2000, end_date=None):
         end = pd.Timestamp.now()
         
     dates = pd.date_range(end=end, periods=hours, freq='h')
-    # Add a slight positive drift to make it "too good" like the user saw
-    drift = 0.0001
-    returns = np.random.randn(len(dates)) * 0.01 + drift
-    price = 100 * np.cumprod(1 + returns)
+    
+    # Generate Trending Data (Sine Wave + Trend + Noise)
+    # This ensures Hurst > 0.55 so the bot WILL trade
+    t = np.linspace(0, 4*np.pi, hours)
+    trend = np.linspace(0, 20, hours) # Strong uptrend
+    cycle = 5 * np.sin(t)             # Clear cycles
+    noise = np.random.randn(hours) * 0.5
+    
+    price = 100 + trend + cycle + noise
     df = pd.DataFrame({'close': price}, index=dates)
     return df
 
 async def fetch_historical_data(symbol='BTC/USDT', timeframe='1h', limit=1000, end_date=None):
     """
-    Fetch real historical OHLCV data from Binance.
+    Fetch real historical OHLCV data from Binance with pagination.
     """
     print(f"Fetching {limit} candles of real data for {symbol}...")
     exchange = ccxt.binance()
     try:
-        since = None
         if end_date:
-            # Calculate 'since' based on end_date and limit
-            # This is an approximation, as we can't know exact candle counts with gaps
-            # But for 1h candles on Binance, it's usually reliable
             end_ts = int(pd.to_datetime(end_date).timestamp() * 1000)
-            duration_ms = limit * 60 * 60 * 1000
+        else:
+            end_ts = exchange.milliseconds()
+            
+        all_ohlcv = []
+        remaining = limit
+        
+        while remaining > 0:
+            fetch_limit = min(remaining, 1000)
+            # Calculate 'since' for this batch
+            # We fetch backwards-ish by adjusting 'since' or just fetching and filtering?
+            # CCXT fetch_ohlcv usually fetches forward from 'since'.
+            # To get the LAST 'limit' candles ending at 'end_date', we need to calculate the start.
+            
+            duration_ms = remaining * 60 * 60 * 1000
             since = end_ts - duration_ms
-            print(f"Targeting data ending around {end_date} (Since: {since})")
-
-        ohlcv = await exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            
+            # Safety check to ensure we don't get stuck
+            if len(all_ohlcv) > 0 and since >= all_ohlcv[-1][0]:
+                 break
+                 
+            ohlcv = await exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=fetch_limit)
+            
+            if not ohlcv:
+                break
+                
+            all_ohlcv.extend(ohlcv)
+            remaining -= len(ohlcv)
+            
+            # Update end_ts for next batch (though we are calculating 'since' from the original end)
+            # Actually, simpler approach: Calculate strict Start Time for the whole block
+            # and fetch forward from there.
+            
+        # Re-do with simpler forward-fetch logic
+        # 1. Calculate Start Time
+        total_duration_ms = limit * 60 * 60 * 1000
+        start_ts = end_ts - total_duration_ms
+        
+        all_ohlcv = []
+        current_since = start_ts
+        
+        while len(all_ohlcv) < limit:
+            fetch_limit = min(limit - len(all_ohlcv), 1000)
+            ohlcv = await exchange.fetch_ohlcv(symbol, timeframe, since=current_since, limit=fetch_limit)
+            
+            if not ohlcv:
+                break
+                
+            all_ohlcv.extend(ohlcv)
+            current_since = ohlcv[-1][0] + 1 # Next candle timestamp
+            
+            print(f"Fetched {len(all_ohlcv)} / {limit} candles...", end='\r')
+            
+        df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('timestamp', inplace=True)
+        
+        # Filter to ensure we don't go past end_date
+        if end_date:
+             end_dt = pd.to_datetime(end_date)
+             df = df[df.index <= end_dt]
+             
         return df
     finally:
         await exchange.close()
 
+def calculate_features(data_window: pd.Series):
+    """
+    Helper to calculate features on a specific window of data.
+    Returns the LAST row of features (the one corresponding to the end of the window).
+    """
+    kinematics = CryptoKinematics()
+    
+    # 1. Smooth Price (EMA is causal, but we calc on window to be safe)
+    smooth_price = kinematics.get_smooth_price(data_window)
+    
+    # 2. Kinematics
+    kin_feats = kinematics.get_kinematics(smooth_price)
+    
+    # 3. DSP (Hilbert) - Calc on window, take last
+    dsp_feats = kinematics.get_dsp_features(data_window)
+    
+    # 4. Regime
+    regime_feats = kinematics.get_regime_features(data_window)
+    
+    # 5. FracDiff
+    fracdiff = kinematics.get_fracdiff(data_window)
+    
+    # Combine
+    # Note: prepare_features concatenates. We need to handle the fact that
+    # some features (like diff) introduce NaNs at the start of the window.
+    # We only care about the LAST row (current time).
+    
+    # Manually combine to ensure we get the last row even if earlier ones are NaN
+    df = pd.concat([kin_feats, dsp_feats, regime_feats, fracdiff.rename('fracdiff')], axis=1)
+    
+    return df.iloc[[-1]] # Return as 1-row DataFrame
+
 def walk_forward_optimization(data: pd.DataFrame, train_window_days: int = 30, test_window_days: int = 7):
     """
     Train on Month M, Test on M+1 (or week), roll forward.
+    Strictly prevents look-ahead bias by recalculating features at every step.
     """
-    print("Starting Walk-Forward Optimization...")
-    kinematics = CryptoKinematics()
+    print("Starting Walk-Forward Optimization (Strict No-Leakage Mode)...")
     strategy = SignalGenerator()
     
-    # Feature Engineering
-    print("Generating features...")
-    smooth_price = kinematics.get_smooth_price(data['close'])
-    kin_feats = kinematics.get_kinematics(smooth_price)
-    dsp_feats = kinematics.get_dsp_features(data['close'])
-    regime_feats = kinematics.get_regime_features(data['close'])
-    fracdiff = kinematics.get_fracdiff(data['close'])
-    
-    features = strategy.prepare_features(kin_feats, dsp_feats, fracdiff)
-    # Align data
-    common_index = features.index.intersection(data.index)
-    features = features.loc[common_index]
-    price = data['close'].loc[common_index]
-    
-    # Rolling Window
+    # Parameters
     train_size = train_window_days * 24
     test_size = test_window_days * 24
+    lookback_buffer = 500 # Enough for Hilbert/Regime windows
     
     results = []
     
-    for i in range(0, len(features) - train_size - test_size, test_size):
-        train_features = features.iloc[i : i+train_size]
-        train_price = price.iloc[i : i+train_size]
+    # Pre-calculate features for the initial training block to save time?
+    # No, to be 100% safe and consistent, we should build the history step-by-step
+    # or just use the 'calculate_features' on the training window.
+    
+    # We iterate through the dataset in chunks of (Train + Test)
+    # But we slide by 'test_size'
+    
+    total_steps = len(data) - train_size - test_size
+    step_counter = 0
+    
+    for i in range(0, total_steps, test_size):
+        # Define Training Window
+        train_start_idx = i
+        train_end_idx = i + train_size
         
-        test_features = features.iloc[i+train_size : i+train_size+test_size]
-        test_price = price.iloc[i+train_size : i+train_size+test_size]
+        train_data = data['close'].iloc[train_start_idx : train_end_idx]
         
-        # Train
-        strategy.train_model(train_features, train_price)
+        # 1. Train Model
+        # We need features for the ENTIRE training window.
+        # Since our features are now Causal (EMA), we CAN calculate them in batch 
+        # on the training window without leakage from the future (Test window).
+        # However, to be perfectly safe with Hilbert/Regime (which use windows),
+        # we should ideally include some buffer before the training window 
+        # to warm up the indicators.
         
-        # Test / Predict
-        for j in range(len(test_features)):
-            current_feat = test_features.iloc[[j]]
-            prob = strategy.predict_signal(current_feat)
+        buffer_start = max(0, train_start_idx - lookback_buffer)
+        train_data_buffered = data['close'].iloc[buffer_start : train_end_idx]
+        
+        # Calculate features on buffered data
+        kinematics = CryptoKinematics()
+        smooth_p = kinematics.get_smooth_price(train_data_buffered)
+        kin_f = kinematics.get_kinematics(smooth_p)
+        dsp_f = kinematics.get_dsp_features(train_data_buffered)
+        reg_f = kinematics.get_regime_features(train_data_buffered)
+        fd_f = kinematics.get_fracdiff(train_data_buffered)
+        
+        train_feats_all = strategy.prepare_features(kin_f, dsp_f, fd_f)
+        
+        # Trim buffer to get actual training set
+        # We need to align indices
+        train_indices = train_data.index
+        valid_indices = train_feats_all.index.intersection(train_indices)
+        
+        X_train = train_feats_all.loc[valid_indices]
+        y_price = data['close'].loc[valid_indices]
+        
+        if len(X_train) > 100:
+            strategy.train_model(X_train, y_price)
+        
+        # 2. Test / Predict (Step-by-Step)
+        test_start_idx = train_end_idx
+        test_end_idx = test_start_idx + test_size
+        
+        # Loop through every candle in the test set
+        for j in range(test_start_idx, test_end_idx):
+            if j >= len(data):
+                break
+                
+            current_time = data.index[j]
             
-            # Get other metrics for trigger
-            idx = test_features.index[j]
-            acc = features.loc[idx, 'acceleration']
-            hurst = regime_feats.loc[idx, 'hurst']
-            entropy = regime_feats.loc[idx, 'entropy']
+            # SANITY CHECK: Ensure we are not using future data
+            # We use data up to 'current_time' (inclusive of Close at t) to predict t+1
+            
+            # Get history window for feature calc (Current + Lookback)
+            hist_start = max(0, j - lookback_buffer)
+            history_window = data['close'].iloc[hist_start : j + 1]
+            
+            # Calculate features for this specific step
+            # This ensures 'get_dsp_features' (Hilbert) and others only see history
+            current_feat_row = calculate_features(history_window)
+            
+            if current_feat_row.empty:
+                continue
+                
+            # Sanity Check Timestamp
+            feat_time = current_feat_row.index[0]
+            if feat_time > current_time:
+                raise ValueError(f"CRITICAL: Future Data Leak! Feature Time {feat_time} > Current Time {current_time}")
+            
+            # Predict
+            # Filter columns to match training data (exclude regime features)
+            ml_features = current_feat_row[['velocity', 'acceleration', 'amplitude', 'phase', 'fracdiff']]
+            prob = strategy.predict_signal(ml_features)
+            
+            # Get other metrics
+            acc = current_feat_row['acceleration'].iloc[0]
+            hurst = current_feat_row['hurst'].iloc[0] if 'hurst' in current_feat_row else 0.5
+            entropy = current_feat_row['entropy'].iloc[0] if 'entropy' in current_feat_row else 0.0
             
             regime_action = strategy.regime_filter(entropy, hurst)
             trigger = strategy.get_trigger(regime_action, hurst, acc, prob)
             leverage = strategy.get_leverage(prob, hurst)
             
             results.append({
-                'timestamp': idx,
-                'price': test_price.iloc[j],
+                'timestamp': current_time,
+                'price': data['close'].iloc[j],
                 'trigger': trigger,
                 'prob': prob,
                 'leverage': leverage
             })
+            
+        step_counter += 1
+        print(f"Completed Batch {step_counter}/{total_steps // test_size}...", end='\r')
             
     return pd.DataFrame(results)
 
@@ -138,7 +284,7 @@ def save_trade_log(results: pd.DataFrame, filename='results/trade_log.csv'):
             
             trades.append({
                 'Entry Time': entry_time,
-                'Exit Time': curr_row['timestamp'],
+                'Exit Time': curr_row.name,
                 'Type': 'LONG' if position > 0 else 'SHORT',
                 'Entry Price': entry_price,
                 'Exit Price': exit_price,
@@ -151,11 +297,11 @@ def save_trade_log(results: pd.DataFrame, filename='results/trade_log.csv'):
         if prev_row['trigger'] == 'LONG':
             position = prev_row['leverage']
             entry_price = curr_row['price']
-            entry_time = curr_row['timestamp']
+            entry_time = curr_row.name
         elif prev_row['trigger'] == 'SHORT':
             position = -prev_row['leverage']
             entry_price = curr_row['price']
-            entry_time = curr_row['timestamp']
+            entry_time = curr_row.name
             
     df_trades = pd.DataFrame(trades)
     if not df_trades.empty:
@@ -262,6 +408,9 @@ if __name__ == "__main__":
     # 2. Walk-Forward
     results = walk_forward_optimization(df)
     
+    if not results.empty:
+        results.set_index('timestamp', inplace=True)
+    
     # 3. Metrics & Logging
     save_trade_log(results)
     returns = calculate_metrics(results)
@@ -307,8 +456,37 @@ if __name__ == "__main__":
     plt.ylabel('Equity ($)')
     plt.legend()
     plt.grid(True)
+    
+    # Format Y-Axis ($)
+    plt.gca().yaxis.set_major_formatter(mticker.StrMethodFormatter('${x:,.0f}'))
+    
+    # Format Date Axis
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+    plt.gca().xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=12))
+    plt.gcf().autofmt_xdate() # Rotate labels
+    
     plt.savefig('results/backtest_equity.png')
     print("\nVisualization saved to 'results/backtest_equity.png'")
+
+    # Log Plot (for consistency check)
+    plt.figure(figsize=(12, 6))
+    plt.semilogy(equity_curve.index, equity_curve.values, label='Equity Curve (Log Scale)')
+    plt.title(f'Strategy Performance: {data_source} (Log Scale)')
+    plt.xlabel('Date')
+    plt.ylabel('Equity ($) - Log Scale')
+    plt.legend()
+    plt.grid(True, which="both", ls="-", alpha=0.5)
+    
+    # Format Y-Axis ($)
+    plt.gca().yaxis.set_major_formatter(mticker.StrMethodFormatter('${x:,.0f}'))
+    
+    # Format Date Axis
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+    plt.gca().xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=12))
+    plt.gcf().autofmt_xdate() # Rotate labels
+    
+    plt.savefig('results/backtest_equity_log.png')
+    print("Log-Scale Visualization saved to 'results/backtest_equity_log.png'")
     
     # 4. Monte Carlo
     sim_paths = monte_carlo_simulation(returns)

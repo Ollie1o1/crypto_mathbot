@@ -16,10 +16,8 @@ class CryptoKinematics:
         """
         Apply a Savitzky-Golay Filter to the Close price to remove noise.
         """
-        # Window length must be odd
-        if window_length % 2 == 0:
-            window_length += 1
-        return pd.Series(savgol_filter(close, window_length, polyorder), index=close.index)
+        # Use EMA for Causal Smoothing (Look-Ahead Bias Free)
+        return close.ewm(span=window_length).mean()
 
     def get_kinematics(self, smooth_price: pd.Series) -> pd.DataFrame:
         """
