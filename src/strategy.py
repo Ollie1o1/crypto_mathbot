@@ -66,11 +66,10 @@ class SignalGenerator:
         # Predict: Will price rise more than 0.1% in next 'time_horizon' candles?
         future_returns = price.shift(-time_horizon) / price - 1
         
-        # Target: 1 (Buy) if Ret > 0.001 (Cost+Slippage), 0 (Short/Hold) if Ret < -0.001
-        # For simplicity, let's try standard directional classification first:
-        # 1 if Ret > 0, 0 if Ret < 0
-        
-        y = (future_returns > 0).astype(int)
+        # HURDLE RATE: 0.2% to cover fees (0.1% entry + 0.1% exit) + slippage
+        # Only learn to trade moves larger than this.
+        HURDLE = 0.002
+        y = (future_returns > HURDLE).astype(int)
         
         # Align
         common_idx = features.index.intersection(y.index)
@@ -104,6 +103,14 @@ class SignalGenerator:
     def predict_signal(self, current_features: pd.DataFrame) -> float:
         if not self.is_trained:
             return 0.5
+            
+        # REGIME FILTER: Efficiency Ratio Check
+        # If market is choppy (low efficiency), do not trade.
+        if 'efficiency_ratio' in current_features.columns:
+            er = current_features['efficiency_ratio'].iloc[-1]
+            if er < 0.3:
+                return 0.5  # Neutral / Cash
+            
         # Return probability of Class 1 (Up)
         return self.model.predict_proba(current_features)[:, 1][0]
 

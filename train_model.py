@@ -24,7 +24,7 @@ async def main():
     
     # We must generate features exactly as they appear in live trading:
     # by looking only at the past window.
-    window_size = 1000 # Context for Hilbert
+    window_size = 200 # Fixed mismatch (was 1000), aligned with validation
     features_list = []
     
     # We need at least window_size data points to start

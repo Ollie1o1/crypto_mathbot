@@ -24,6 +24,8 @@ cryptoLEV/
 
 - **Strict Causality**: All features are calculated using sliding windows to prevent data leakage.
 - **Robust Statistics**: Log-Returns, Volatility, Skewness, Kurtosis (Tail Risk).
+- **Regime Filter**: Automatically **"Sits Out"** of choppy markets (Efficiency Ratio < 0.3).
+- **Hurdle Rate**: Model matches **Profit > Fees (0.2%)** target, not just direction.
 - **Machine Learning**: XGBoost Classifier with **Robust Defaults** (preventing overfitting).
 - **Execution**: Continuous **Kelly Criterion** with Volatility Targeting.
 - **Validation**: Strict Walk-Forward Backtesting with **0.1% Transaction Fees**.
