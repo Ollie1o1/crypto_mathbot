@@ -34,7 +34,7 @@ async def main():
         df_hist.set_index('timestamp', inplace=True)
         
         # Train
-        features = kinematics.generate_all_features(df_hist['close'])
+        features = kinematics.generate_all_features(df_hist['close'], window_size=300)
         
         # Align
         common = features.index.intersection(df_hist.index)
@@ -52,7 +52,7 @@ async def main():
             
             # Feature Generation
             # This generates features for the whole window, but we only use the last one for prediction
-            features = kinematics.generate_all_features(df['close'])
+            features = kinematics.generate_all_features(df['close'], window_size=300)
             
             if features.empty:
                 print("Not enough data for features.")

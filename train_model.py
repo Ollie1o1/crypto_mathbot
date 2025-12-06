@@ -9,13 +9,14 @@ from src.strategy import SignalGenerator
 async def main():
     parser = argparse.ArgumentParser(description='Train Strategy Model')
     parser.add_argument('--symbol', type=str, default='BTC/USDT', help='Symbol to train on')
+    parser.add_argument('--timeframe', type=str, default='1h', help='Timeframe (e.g. 1h, 4h)')
     parser.add_argument('--limit', type=int, default=5000, help='Number of candles to fetch')
     parser.add_argument('--save_path', type=str, default='models/xgb_model.json', help='Path to save the model')
     args = parser.parse_args()
 
     # 1. Fetch Data
-    print(f"Fetching {args.limit} candles for {args.symbol}...")
-    df = await fetch_historical_data(symbol=args.symbol, limit=args.limit)
+    print(f"Fetching {args.limit} candles ({args.timeframe}) for {args.symbol}...")
+    df = await fetch_historical_data(symbol=args.symbol, timeframe=args.timeframe, limit=args.limit)
     print(f"Fetched {len(df)} candles.")
 
     # 2. Generate Features (Causal / Sliding Window)
@@ -24,7 +25,7 @@ async def main():
     
     # We must generate features exactly as they appear in live trading:
     # by looking only at the past window.
-    window_size = 200 # Fixed mismatch (was 1000), aligned with validation
+    window_size = 300# Fixed mismatch (was 1000), aligned with validation
     features_list = []
     
     # We need at least window_size data points to start

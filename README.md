@@ -90,12 +90,15 @@ Optimize the XGBoost model parameters using Optuna.
 python optimize.py --limit 2000 --trials 50
 ```
 
-### 4. Quick Backtest (Walk-Forward)
+### 4. Backtesting (Walk-Forward)
 Run the validation script directly to perform a Walk-Forward Optimization (Train/Test rolling window) on the fly.
 
 ```bash
-# Default description
+# Default (1H Timeframe)
 python validate_strategy.py --limit 3000
+
+# 4H Timeframe (Better Signal/Noise)
+python validate_strategy.py --timeframe 4h --limit 2000
 ```
 
 **Output:**

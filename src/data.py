@@ -16,7 +16,9 @@ async def fetch_historical_data(symbol='BTC/USDT', timeframe='1h', limit=1000, e
             end_ts = exchange.milliseconds()
             
         # Calculate Start Time
-        total_duration_ms = limit * 60 * 60 * 1000
+        # Dynamic Timeframe Parsing
+        tf_seconds = exchange.parse_timeframe(timeframe)
+        total_duration_ms = limit * tf_seconds * 1000
         start_ts = end_ts - total_duration_ms
         
         all_ohlcv = []

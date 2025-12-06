@@ -66,9 +66,9 @@ class SignalGenerator:
         # Predict: Will price rise more than 0.1% in next 'time_horizon' candles?
         future_returns = price.shift(-time_horizon) / price - 1
         
-        # HURDLE RATE: 0.2% to cover fees (0.1% entry + 0.1% exit) + slippage
-        # Only learn to trade moves larger than this.
-        HURDLE = 0.002
+        # HURDLE RATE: Set to 0.0 to fix Class Imbalance (Learn pure direction)
+        # We rely on Validation fees to filter bad strategies
+        HURDLE = 0.0
         y = (future_returns > HURDLE).astype(int)
         
         # Align
@@ -108,7 +108,7 @@ class SignalGenerator:
         # If market is choppy (low efficiency), do not trade.
         if 'efficiency_ratio' in current_features.columns:
             er = current_features['efficiency_ratio'].iloc[-1]
-            if er < 0.3:
+            if er < 0.4:
                 return 0.5  # Neutral / Cash
             
         # Return probability of Class 1 (Up)
@@ -116,7 +116,7 @@ class SignalGenerator:
 
     def get_action(self, probability: float, threshold: float = 0.55) -> str:
         """
-        Simple Action Trigger.
+        Simple Action Trigger (Long Only).
         """
         if probability > threshold:
             return 'LONG'

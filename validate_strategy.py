@@ -34,7 +34,7 @@ def strict_backtest(data: pd.DataFrame, model_path: str = None, lookback_window:
         test_data = data.iloc[train_size:]
         
         print(f"Training initial model on first {train_size} candles...")
-        features_train = kinematics.generate_all_features(train_data['close'], window_size=200)
+        features_train = kinematics.generate_all_features(train_data['close'], window_size=300)
         
         # Align
         common = features_train.index.intersection(train_data.index)
@@ -87,7 +87,7 @@ def strict_backtest(data: pd.DataFrame, model_path: str = None, lookback_window:
         
         # 2. Generate Features (Latest row only)
         # We generate the whole window then take the last row
-        features = kinematics.generate_all_features(current_slice['close'], window_size=200)
+        features = kinematics.generate_all_features(current_slice['close'], window_size=300)
         
         if features.empty:
             continue
@@ -188,8 +188,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--limit', type=int, default=3000)
     parser.add_argument('--model_path', type=str, default=None)
+    parser.add_argument('--timeframe', type=str, default='1h')
     parser.add_argument('--symbol', type=str, default='BTC/USDT')
     args = parser.parse_args()
     
-    df = asyncio.run(fetch_historical_data(symbol=args.symbol, limit=args.limit))
+    df = asyncio.run(fetch_historical_data(symbol=args.symbol, timeframe=args.timeframe, limit=args.limit))
     strict_backtest(df, args.model_path)
