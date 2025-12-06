@@ -1,34 +1,44 @@
 import pandas as pd
 import numpy as np
 from xgboost import XGBClassifier
-import torch
+try:
+    import torch
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
 
 class SignalGenerator:
     """
-    Decision Engine combining ML Classification and Kelly Criterion.
-    
-    Refactored for Production:
-    - Dynamic Volatility Barriers (Triple Barrier Method)
-    - Removed Hardcoded Regime Filters (ML learns them)
-    - Continuous Kelly Criterion for Sizing
-    - GPU Acceleration Support
+    Decision Engine with Optimized Hyperparameters and GPU Support.
     """
     
     def __init__(self):
         # Check for GPU
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        tree_method = 'hist' if self.device == 'cuda' else 'auto'
+        if HAS_TORCH and torch.cuda.is_available():
+            self.device = 'cuda'
+            self.tree_method = 'hist'
+        else:
+            self.device = 'cpu'
+            self.tree_method = 'auto'
         
-        print(f"Initializing XGBoost on {self.device.upper()}...")
+        print(f"Initializing Model on {self.device.upper()}...")
         
+        # OPTIMIZED PARAMETERS (Found via Optuna on 3000 candles)
         self.model = XGBClassifier(
-            n_estimators=100, 
-            learning_rate=0.05, 
-            max_depth=5, 
+            n_estimators=141,
+            learning_rate=0.012290387288834912,
+            max_depth=7,
+            subsample=0.6000064397230108,
+            colsample_bytree=0.9602500828990242,
+            gamma=0.4205312152212468,
+            min_child_weight=10,
+            
+            # Standard Config
             objective='binary:logistic',
             eval_metric='logloss',
-            tree_method=tree_method,
-            device=self.device
+            n_jobs=-1,
+            device=self.device,
+            tree_method=self.tree_method
         )
         self.is_trained = False
 
@@ -42,21 +52,13 @@ class SignalGenerator:
         print(f"Model loaded from {filepath}")
 
     def prepare_features(self, kinematics: pd.DataFrame, dsp: pd.DataFrame, fracdiff: pd.Series, regime: pd.DataFrame) -> pd.DataFrame:
-        """
-        Combine features for the ML model.
-        Now includes Regime features (Hurst, Entropy) so the model can learn them.
-        """
-        features = pd.concat([kinematics, dsp, fracdiff.rename('fracdiff'), regime], axis=1)
+        features = pd.concat([kinematics, dsp, regime, fracdiff.rename('fracdiff')], axis=1)
         return features.dropna()
 
     def train_model(self, features: pd.DataFrame, price: pd.Series, time_horizon: int = 12, barrier_multiplier: float = 2.0):
-        """
-        Train using Dynamic Triple Barrier Method.
-        Barrier Width = Daily Volatility * Multiplier
-        """
-        # Calculate Volatility (Standard Deviation of Returns)
+        # 1. Volatility Calculation
         returns = price.pct_change()
-        volatility = returns.rolling(window=24).std() # 24-hour volatility
+        volatility = returns.rolling(window=24).std()
         
         labels = []
         valid_indices = []
@@ -67,15 +69,16 @@ class SignalGenerator:
         price = price.loc[common_idx]
         volatility = volatility.loc[common_idx]
         
+        # 2. Triple Barrier Labeling
+        # We can speed this up, but the loop is safer for logic verification
         for i in range(len(price) - time_horizon):
-            current_price = price.iloc[i]
             current_vol = volatility.iloc[i]
-            
             if pd.isna(current_vol) or current_vol == 0:
                 continue
                 
-            # Dynamic Barrier
+            current_price = price.iloc[i]
             barrier = current_vol * barrier_multiplier
+            
             upper = current_price * (1 + barrier)
             lower = current_price * (1 - barrier)
             
@@ -91,58 +94,69 @@ class SignalGenerator:
                 labels.append(0)
                 valid_indices.append(features.index[i])
             else:
-                # Timed out (Vertical Barrier) - Label 0 (or ignore)
-                # For binary classification, we treat timeout as "No Trade" or 0
                 labels.append(0)
                 valid_indices.append(features.index[i])
                 
-        # Align features with labels
         X = features.loc[valid_indices]
         y = np.array(labels)
         
-        print(f"Training on {len(X)} samples with Dynamic Barriers...")
+        print(f"Training on {len(X)} samples...")
         self.model.fit(X, y)
         self.is_trained = True
 
     def predict_signal(self, current_features: pd.DataFrame) -> float:
-        """
-        Returns probability of hitting upper barrier.
-        """
         if not self.is_trained:
             return 0.5
-            
-        prob = self.model.predict_proba(current_features)[:, 1][0]
-        return prob
+        # Ensure input is on the correct device if using PyTorch tensors, but DataFrame is fine
+        return self.model.predict_proba(current_features)[:, 1][0]
 
     def get_leverage(self, probability: float, volatility: float, target_vol: float = 0.05, max_leverage: float = 4.0) -> float:
-        """
-        Continuous Kelly Criterion with Volatility Targeting.
+        # Kelly Fraction (2p - 1)
+        raw_kelly = 2 * probability - 1 
         
-        1. Kelly Fraction = (p - q) / 1 (assuming 1:1 odds for simplicity, or 2p-1)
-           Refined: 2 * Probability - 1
-        2. Volatility Scalar = Target_Vol / Current_Vol
-        3. Leverage = Kelly * Scalar * Capital_Factor (0.5 for Half-Kelly)
-        """
-        # 1. Kelly Fraction (Directional Conviction)
-        # Prob > 0.5 -> Long, Prob < 0.5 -> Short
-        # We return signed leverage to indicate direction
-        
-        raw_kelly = 2 * probability - 1 # Range [-1, 1]
-        
-        # Filter weak signals
-        if abs(raw_kelly) < 0.1: # Equivalent to Prob between 0.45 and 0.55
+        if abs(raw_kelly) < 0.1: 
             return 0.0
             
-        # 2. Volatility Scalar
+        # Volatility Scalar
         if volatility <= 0:
             vol_scalar = 1.0
         else:
             vol_scalar = target_vol / volatility
             
-        # 3. Final Leverage (Half-Kelly for safety)
+        # Half-Kelly
         leverage = raw_kelly * vol_scalar * 0.5
+        return np.clip(leverage, -max_leverage, max_leverage)
+
+    def regime_filter(self, entropy: float, hurst: float) -> str:
+        """
+        Identify Market Regime.
+        """
+        if pd.isna(hurst) or pd.isna(entropy):
+            return 'WAIT'
+            
+        if hurst > 0.55:
+            return 'TREND'
+        elif hurst < 0.45:
+            return 'MEAN_REVERSION'
+        else:
+            return 'RANDOM'
+
+    def get_trigger(self, regime: str, hurst: float, acceleration: float, probability: float) -> str:
+        """
+        Generate Trade Trigger based on Model Probability and Regime.
+        """
+        # 1. Filter by Regime
+        if regime == 'RANDOM' or regime == 'WAIT':
+            return 'HOLD'
+            
+        # 2. Probability Thresholds
+        # 0 - 1 Score from XGBoost
+        # > 0.55 -> LONG
+        # < 0.45 -> SHORT
         
-        # Cap leverage
-        leverage = np.clip(leverage, -max_leverage, max_leverage)
-        
-        return leverage
+        if probability > 0.55:
+            return 'LONG'
+        elif probability < 0.45:
+            return 'SHORT'
+            
+        return 'HOLD'

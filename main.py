@@ -34,17 +34,24 @@ async def main():
     kin_feats_train = kinematics.get_kinematics(smooth_price_train)
     dsp_feats_train = kinematics.get_dsp_features(df_history['close'])
     # regime_feats_train = kinematics.get_regime_features(df_history['close']) # Not needed for training input, only for filter
+    regime_feats_train = kinematics.get_regime_features(df_history['close']) # REQUIRED for model features
     fracdiff_train = kinematics.get_fracdiff(df_history['close'])
     
-    features_train = strategy.prepare_features(kin_feats_train, dsp_feats_train, fracdiff_train)
+    features_train = strategy.prepare_features(kin_feats_train, dsp_feats_train, fracdiff_train, regime_feats_train)
     
     # Align price with features
     common_index = features_train.index.intersection(df_history.index)
     features_train = features_train.loc[common_index]
     price_train = df_history['close'].loc[common_index]
     
-    strategy.train_model(features_train, price_train)
-    print("Model trained successfully.")
+    model_path = 'models/optimized_model.json'
+    if os.path.exists(model_path):
+        print(f"Loading optimized model from {model_path}...")
+        strategy.load_model(model_path)
+    else:
+        print("Training initial model...")
+        strategy.train_model(features_train, price_train)
+        print("Model trained successfully.")
     
     try:
         while True:
@@ -61,7 +68,7 @@ async def main():
             regime_feats = kinematics.get_regime_features(df['close'])
             fracdiff = kinematics.get_fracdiff(df['close'])
             
-            features = strategy.prepare_features(kin_feats, dsp_feats, fracdiff)
+            features = strategy.prepare_features(kin_feats, dsp_feats, fracdiff, regime_feats)
             
             if features.empty:
                 print("Not enough data for features.")

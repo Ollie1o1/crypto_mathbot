@@ -125,9 +125,10 @@ As of Dec 2025, the Production Model (`xgb_prod.json`) achieved the following on
 - **Trades**: 1322
 
 ### 4. Live Trading
-Run the main bot to start the training and execution loop:
+Run the main bot to start the execution loop:
 ```bash
 python main.py
 ```
-- The bot will first fetch 1000 candles to train the model.
-- It will then check the market every 60 seconds.
+- The bot will **automatically load** `models/optimized_model.json` if it exists (Recommended).
+- If no model is found, it will fetch 1000 candles and train a new one from scratch.
+- It scans the market every 60 seconds.
