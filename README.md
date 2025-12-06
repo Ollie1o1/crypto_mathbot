@@ -115,20 +115,19 @@ python validate_strategy.py --limit 5000
         3.  **AI Confidence is High** (> 65%)
     - If conditions aren't perfect, it stays in **CASH** to prevent ruin.
 
-## Performance (Production Model)
+## Performance & Validation
 
-As of Dec 2025, the Production Model (`xgb_prod.json`) achieved the following on 2000 hours of out-of-sample data:
-
-- **Total Return**: +47.76%
-- **Sharpe Ratio**: 2.54
-- **Calmar Ratio**: 11.14
-- **Trades**: 1322
+**Important: Anti-Cheating Protocol**
+We have implemented a **Strict Causal Backtester** in `validate_strategy.py`.
+- Previous versions (and most public bots) use vectorized feature generation which can accidentally "leak" future data (e.g., Hilbert Transform on the whole dataset).
+- This bot now recalculates features **step-by-step** using a sliding window, exactly mimicking live trading.
+- **Result**: Backtests are slower but 100% realistic. No more "4,000,000% returns" artifacts.
 
 ### 4. Live Trading
 Run the main bot to start the execution loop:
 ```bash
 python main.py
 ```
-- The bot will **automatically load** `models/optimized_model.json` if it exists (Recommended).
-- If no model is found, it will fetch 1000 candles and train a new one from scratch.
-- It scans the market every 60 seconds.
+- The bot will **automatically load** `models/optimized_model.json` if it exists.
+- **Note**: Ensure you retrain your model using the updated `train_model.py` to ensure the model learns from strictly causal features.
+- If no model is found, it will train a fresh one.

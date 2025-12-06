@@ -18,10 +18,44 @@ async def main():
     df = await fetch_historical_data(symbol=args.symbol, limit=args.limit)
     print(f"Fetched {len(df)} candles.")
 
-    # 2. Generate Features
-    print("Generating features...")
+    # 2. Generate Features (Causal / Sliding Window)
+    print("Generating features (Sliding Window for Causality)...")
     kinematics = CryptoKinematics()
-    features = kinematics.generate_all_features(df['close'])
+    
+    # We must generate features exactly as they appear in live trading:
+    # by looking only at the past window.
+    window_size = 1000 # Context for Hilbert
+    features_list = []
+    
+    # We need at least window_size data points to start
+    if len(df) < window_size:
+        print("Not enough data for window size.")
+        return
+
+    # Loop through the dataset
+    # Optimization: To speed up, we can assume early features (pre-Hilbert convergence) are noise 
+    # and just start training after window_size.
+    
+    # Actually, we can just use the slow loop for correctness.
+    # It's training, run once.
+    
+    start_idx = window_size
+    for i in range(start_idx, len(df)):
+        # Slice: T-Window to T
+        window = df.iloc[i-window_size : i+1]
+        
+        # Compute features
+        feats = kinematics.generate_all_features(window['close'])
+        
+        # Take the last row (Time T)
+        if not feats.empty:
+            features_list.append(feats.iloc[[-1]])
+            
+        if i % 500 == 0:
+            print(f"Generated {i}/{len(df)} feature rows...", end='\r')
+            
+    print("\nConcatenating features...")
+    features = pd.concat(features_list)
     
     # 3. Prepare for Training
     strategy = SignalGenerator()

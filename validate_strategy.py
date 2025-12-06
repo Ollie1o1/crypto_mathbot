@@ -112,60 +112,75 @@ def walk_forward_optimization(data: pd.DataFrame, train_window_days: int = 30, t
 
 def run_static_backtest(data: pd.DataFrame, model_path: str):
     """
-    Run backtest using a pre-trained model (No re-training).
-    Vectorized for speed.
+    Run backtest using a pre-trained model with STRICT CAUSALITY.
+    Features are re-calculated at every step using a sliding window.
     """
-    print(f"Starting Static Backtest with model: {model_path}")
+    print(f"Starting Strict Backtest with model: {model_path}")
     strategy = SignalGenerator()
     strategy.load_model(model_path)
-    
-    # 1. Pre-calculate Features
-    print("Generating features...")
     kinematics = CryptoKinematics()
-    all_features = kinematics.generate_all_features(data['close'])
-    
-    # 2. Align Data
-    common_idx = all_features.index.intersection(data.index)
-    all_features = all_features.loc[common_idx]
-    data = data.loc[common_idx]
-    
-    # 3. Batch Prediction (Much Faster)
-    print("Running Batch Prediction...")
-    probs = strategy.model.predict_proba(all_features)[:, 1]
-    
-    # 4. Vectorized Logic
-    print("Calculating Signals...")
-    returns = data['close'].pct_change()
-    volatility = returns.rolling(window=24).std().fillna(0.01)
     
     results = []
+    window_size = 1000 # Must match training context or be sufficient for Hilbert
     
-    # We iterate to apply logic, but prediction is already done
-    # We can vectorize the logic too, but a loop is fine now that heavy lifting is done
+    # Ensure enough data
+    if len(data) <= window_size:
+        print("Not enough data for backtest window.")
+        return pd.DataFrame()
+        
+    print("Running Step-by-Step Backtest (may take a moment)...")
     
-    for i in range(len(data)):
-        current_time = data.index[i]
-        prob = probs[i]
-        vol = volatility.iloc[i]
+    start_idx = window_size
+    total_steps = len(data) - start_idx
+    
+    for i in range(total_steps):
+        # Current index in 'data'
+        current_idx = start_idx + i
         
-        leverage = strategy.get_leverage(prob, vol)
+        # 1. Define Causal Slice (Past to Present)
+        # We look back window_size to compute features for NOW
+        slice_start = max(0, current_idx - window_size)
+        current_slice = data.iloc[slice_start : current_idx + 1]
         
-        trigger = 'HOLD'
-        if leverage > 0:
-            trigger = 'LONG'
-        elif leverage < 0:
-            trigger = 'SHORT'
+        # 2. Generate Features
+        # The last row corresponds to 'current_idx'
+        features = kinematics.generate_all_features(current_slice['close'])
+        
+        if features.empty:
+            continue
             
+        # 3. Predict on the latest feature vector
+        current_feat_row = features.iloc[[-1]]
+        prob = strategy.predict_signal(current_feat_row)
+        
+        # 4. Get Aux Data for Logic
+        # Handle cases where feature generation might drop early rows (not an issue for last row)
+        hurst = current_feat_row['hurst'].iloc[0] if 'hurst' in current_feat_row else 0.5
+        entropy = current_feat_row['entropy'].iloc[0] if 'entropy' in current_feat_row else 0
+        acc = current_feat_row['acceleration'].iloc[0] if 'acceleration' in current_feat_row else 0
+        
+        # 5. Logic
+        regime = strategy.regime_filter(entropy, hurst)
+        trigger = strategy.get_trigger(regime, hurst, acc, prob)
+        
+        # 6. Volatility for Sizing (Causal)
+        # Simple rolling std on the slice
+        volatility = current_slice['close'].pct_change().rolling(24).std().iloc[-1]
+        if pd.isna(volatility) or volatility == 0:
+            volatility = 0.01
+            
+        leverage = strategy.get_leverage(prob, volatility)
+        
         results.append({
-            'timestamp': current_time,
-            'price': data['close'].iloc[i],
+            'timestamp': current_slice.index[-1],
+            'price': current_slice['close'].iloc[-1],
             'trigger': trigger,
             'prob': prob,
-            'leverage': abs(leverage)
+            'leverage': abs(leverage) if trigger != 'HOLD' else 0
         })
         
-        if i % 1000 == 0:
-             print(f"Processed {i}/{len(data)} candles...", end='\r')
+        if i % 100 == 0:
+             print(f"Processed {i}/{total_steps} candles...", end='\r')
             
     return pd.DataFrame(results)
 
