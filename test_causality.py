@@ -16,21 +16,30 @@ def test_causality():
     subset_1 = series.iloc[:200]
     features_1 = kinematics.generate_all_features(subset_1)
     # Check value at index 199 (last known point)
-    val_at_199_run1 = features_1.iloc[-1]['phase']
+    # Using 'volatility_short' or 'momentum_long'
+    feature_name = 'volatility_short'
+    
+    if feature_name not in features_1.columns:
+        print(f"Feature {feature_name} not found. Available: {features_1.columns}")
+        return
+
+    val_at_199_run1 = features_1.iloc[-1][feature_name]
     
     # 3. Calculate features on T=0 to T=201 (One new candle)
     subset_2 = series.iloc[:201]
     features_2 = kinematics.generate_all_features(subset_2)
     # Check value at index 199 (SAME point as before, but now with future knowledge of 201)
-    val_at_199_run2 = features_2.iloc[-2]['phase']
+    # It must NOT change.
+    val_at_199_run2 = features_2.iloc[-2][feature_name]
     
-    print(f"\nValue at Index 199 (Run 1 - End of Data): {val_at_199_run1:.6f}")
+    print(f"\nFeature: {feature_name}")
+    print(f"Value at Index 199 (Run 1 - End of Data): {val_at_199_run1:.6f}")
     print(f"Value at Index 199 (Run 2 - Future Added): {val_at_199_run2:.6f}")
     
     diff = abs(val_at_199_run1 - val_at_199_run2)
     print(f"Difference: {diff:.6f}")
     
-    if diff > 1e-5:
+    if diff > 1e-8:
         print("\n[CRITICAL FAIL] Look-Ahead Bias Detected!")
         print("The past changed when the future happened. This feature is non-causal.")
     else:

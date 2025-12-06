@@ -9,7 +9,7 @@ except ImportError:
 
 class SignalGenerator:
     """
-    Decision Engine with Optimized Hyperparameters and GPU Support.
+    Robust Decision Engine using XGBoost with sensible defaults.
     """
     
     def __init__(self):
@@ -23,22 +23,21 @@ class SignalGenerator:
         
         print(f"Initializing Model on {self.device.upper()}...")
         
-        # OPTIMIZED PARAMETERS (Found via Optuna on 3000 candles)
+        # ROBUST DEFAULTS
+        # Low learning rate + shallow depth = prevents overfitting
         self.model = XGBClassifier(
-            n_estimators=141,
-            learning_rate=0.012290387288834912,
-            max_depth=7,
-            subsample=0.6000064397230108,
-            colsample_bytree=0.9602500828990242,
-            gamma=0.4205312152212468,
-            min_child_weight=10,
+            n_estimators=1000,
+            learning_rate=0.01,
+            max_depth=3,
+            subsample=0.8,
+            colsample_bytree=0.8,
             
-            # Standard Config
             objective='binary:logistic',
             eval_metric='logloss',
             n_jobs=-1,
             device=self.device,
-            tree_method=self.tree_method
+            tree_method=self.tree_method,
+            early_stopping_rounds=50 # Use valid set during training
         )
         self.is_trained = False
 
@@ -51,112 +50,87 @@ class SignalGenerator:
         self.is_trained = True
         print(f"Model loaded from {filepath}")
 
-    def prepare_features(self, kinematics: pd.DataFrame, dsp: pd.DataFrame, fracdiff: pd.Series, regime: pd.DataFrame) -> pd.DataFrame:
-        features = pd.concat([kinematics, dsp, regime, fracdiff.rename('fracdiff')], axis=1)
+    def prepare_features(self, features: pd.DataFrame) -> pd.DataFrame:
+        """
+        Pass-through for the new feature set. 
+        Ensures we drop NaNs before feeding to model.
+        """
         return features.dropna()
 
-    def train_model(self, features: pd.DataFrame, price: pd.Series, time_horizon: int = 12, barrier_multiplier: float = 2.0):
-        # 1. Volatility Calculation
-        returns = price.pct_change()
-        volatility = returns.rolling(window=24).std()
+    def train_model(self, features: pd.DataFrame, price: pd.Series, time_horizon: int = 1):
+        """
+        Train the model to predict next-bar return sign (or decent threshold).
+        Target: Returns > Transaction Costs (e.g. 0.1%)
+        """
+        # 1. Create Target
+        # Predict: Will price rise more than 0.1% in next 'time_horizon' candles?
+        future_returns = price.shift(-time_horizon) / price - 1
         
-        labels = []
-        valid_indices = []
+        # Target: 1 (Buy) if Ret > 0.001 (Cost+Slippage), 0 (Short/Hold) if Ret < -0.001
+        # For simplicity, let's try standard directional classification first:
+        # 1 if Ret > 0, 0 if Ret < 0
         
-        # Align indices
-        common_idx = features.index.intersection(price.index).intersection(volatility.index)
-        features = features.loc[common_idx]
-        price = price.loc[common_idx]
-        volatility = volatility.loc[common_idx]
+        y = (future_returns > 0).astype(int)
         
-        # 2. Triple Barrier Labeling
-        # We can speed this up, but the loop is safer for logic verification
-        for i in range(len(price) - time_horizon):
-            current_vol = volatility.iloc[i]
-            if pd.isna(current_vol) or current_vol == 0:
-                continue
-                
-            current_price = price.iloc[i]
-            barrier = current_vol * barrier_multiplier
-            
-            upper = current_price * (1 + barrier)
-            lower = current_price * (1 - barrier)
-            
-            future_window = price.iloc[i+1 : i+time_horizon+1]
-            
-            hit_upper = future_window[future_window >= upper].index.min()
-            hit_lower = future_window[future_window <= lower].index.min()
-            
-            if pd.notna(hit_upper) and (pd.isna(hit_lower) or hit_upper < hit_lower):
-                labels.append(1)
-                valid_indices.append(features.index[i])
-            elif pd.notna(hit_lower) and (pd.isna(hit_upper) or hit_lower < hit_upper):
-                labels.append(0)
-                valid_indices.append(features.index[i])
-            else:
-                labels.append(0)
-                valid_indices.append(features.index[i])
-                
-        X = features.loc[valid_indices]
-        y = np.array(labels)
+        # Align
+        common_idx = features.index.intersection(y.index)
+        X = features.loc[common_idx]
+        y = y.loc[common_idx]
         
-        print(f"Training on {len(X)} samples...")
-        self.model.fit(X, y)
+        # Train Test Split for Early Stopping (Chronological)
+        split = int(len(X) * 0.8)
+        X_train, X_val = X.iloc[:split], X.iloc[split:]
+        y_train, y_val = y.iloc[:split], y.iloc[split:]
+        
+        print(f"Training on {len(X_train)} samples, Validating on {len(X_val)}...")
+        
+        self.model.fit(
+            X_train, y_train,
+            eval_set=[(X_val, y_val)],
+            verbose=False
+        )
         self.is_trained = True
+        
+        # Feature Importance
+        print("\nFeature Importance:")
+        try:
+            fim = self.model.feature_importances_
+            cols = X.columns
+            for f, v in sorted(zip(cols, fim), key=lambda x: x[1], reverse=True):
+                print(f"{f}: {v:.4f}")
+        except:
+            pass
 
     def predict_signal(self, current_features: pd.DataFrame) -> float:
         if not self.is_trained:
             return 0.5
-        # Ensure input is on the correct device if using PyTorch tensors, but DataFrame is fine
+        # Return probability of Class 1 (Up)
         return self.model.predict_proba(current_features)[:, 1][0]
 
-    def get_leverage(self, probability: float, volatility: float, target_vol: float = 0.05, max_leverage: float = 4.0) -> float:
-        # Kelly Fraction (2p - 1)
-        raw_kelly = 2 * probability - 1 
+    def get_action(self, probability: float, threshold: float = 0.55) -> str:
+        """
+        Simple Action Trigger.
+        """
+        if probability > threshold:
+            return 'LONG'
+        elif probability < (1 - threshold):
+            return 'SHORT'
+        return 'HOLD'
+
+    def get_leverage(self, probability: float, volatility: float, target_vol: float = 0.05, max_leverage: float = 3.0) -> float:
+        """
+        Continuous Kelly-like sizing.
+        """
+        # Probability Confidence (0.5 to 1.0) -> Scaled to 0 to 1
+        confidence = abs(probability - 0.5) * 2
         
-        if abs(raw_kelly) < 0.1: 
+        if confidence < 0.1: # Minimum confidence filter
             return 0.0
             
-        # Volatility Scalar
-        if volatility <= 0:
-            vol_scalar = 1.0
-        else:
-            vol_scalar = target_vol / volatility
-            
-        # Half-Kelly
-        leverage = raw_kelly * vol_scalar * 0.5
-        return np.clip(leverage, -max_leverage, max_leverage)
-
-    def regime_filter(self, entropy: float, hurst: float) -> str:
-        """
-        Identify Market Regime.
-        """
-        if pd.isna(hurst) or pd.isna(entropy):
-            return 'WAIT'
-            
-        if hurst > 0.55:
-            return 'TREND'
-        elif hurst < 0.45:
-            return 'MEAN_REVERSION'
-        else:
-            return 'RANDOM'
-
-    def get_trigger(self, regime: str, hurst: float, acceleration: float, probability: float) -> str:
-        """
-        Generate Trade Trigger based on Model Probability and Regime.
-        """
-        # 1. Filter by Regime
-        if regime == 'RANDOM' or regime == 'WAIT':
-            return 'HOLD'
-            
-        # 2. Probability Thresholds
-        # 0 - 1 Score from XGBoost
-        # > 0.55 -> LONG
-        # < 0.45 -> SHORT
+        # Volatility Scalar (Risk Parity)
+        if volatility <= 0: volatility = 0.01
+        vol_scalar = target_vol / volatility
         
-        if probability > 0.55:
-            return 'LONG'
-        elif probability < 0.45:
-            return 'SHORT'
-            
-        return 'HOLD'
+        raw_leverage = confidence * vol_scalar
+        
+        return np.clip(raw_leverage, 0, max_leverage)

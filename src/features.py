@@ -1,155 +1,93 @@
 import numpy as np
 import pandas as pd
-from scipy.signal import savgol_filter, hilbert
 
 class CryptoKinematics:
     """
-    Feature generation class that transforms raw OHLCV data into mathematical features
-    based on Calculus, Signal Processing, and Chaos Theory.
+    Feature generation class that transforms raw OHLCV data into robust statistical features.
     
-    Refactored for Stationarity:
-    - Uses Log-Returns for Kinematics (Scale Invariance)
-    - Implements Z-Score Normalization
+    Principles:
+    1.  Strict Causality: No future data leakage. Using rolling windows only.
+    2.  Stationarity: Uses Log-Returns as the primary unit.
+    3.  Robustness: Focuses on Volatility, Skewness, Kurtosis rather than fragile cycles.
     """
     
     def __init__(self):
         pass
 
-    def generate_all_features(self, close: pd.Series) -> pd.DataFrame:
+    def generate_all_features(self, close: pd.Series, window_size: int = 100) -> pd.DataFrame:
         """
-        Generate all features for the entire series.
+        Generate all features for the series.
+        CAUTION: When used in backtesting, ensure 'close' contains only PAST data up to time T.
         """
-        # 1. Base Transformations
-        log_price = np.log(close)
-        smooth_log_price = self.get_smooth_price(log_price)
+        # 1. Base Transformations (Log Returns)
+        # ln(P_t / P_{t-1})
+        log_returns = np.log(close / close.shift(1)).fillna(0)
         
-        # 2. Kinematics (on Log Price)
-        kinematics = self.get_kinematics(smooth_log_price)
+        # 2. Volatility (Risk)
+        # Rolling Standard Deviation of Log Returns
+        volatility_short = log_returns.rolling(window=24).std()
+        volatility_long = log_returns.rolling(window=window_size).std()
         
-        # 3. DSP (on Detrended Log Price)
-        dsp = self.get_dsp_features(log_price)
+        # 3. Higher Moments (Tail Risk)
+        skew = log_returns.rolling(window=window_size).skew()
+        kurtosis = log_returns.rolling(window=window_size).kurt()
         
-        # 4. Regime (on Log Returns)
-        regime = self.get_regime_features(close) # Hurst/Entropy handle their own returns calc
+        # 4. Momentum (Trend)
+        # ROC: P_t / P_{t-N} - 1
+        momentum_short = close.pct_change(periods=24)
+        momentum_long = close.pct_change(periods=window_size)
         
-        # 5. FracDiff (on Log Price)
-        fracdiff = self.get_fracdiff(log_price)
+        # 5. Regime (Hurst) - Optimized for speed/stability if needed, 
+        # but for now we stick to standard statistical features which are faster and more robust.
+        # Let's add a simple "Efficiency Ratio" (Kaufman) as a proxy for trend quality.
+        efficiency_ratio = self.get_efficiency_ratio(close, window=24)
         
         # Combine
-        features = pd.concat([kinematics, dsp, regime, fracdiff.rename('fracdiff')], axis=1)
+        features = pd.DataFrame({
+            'log_returns': log_returns,
+            'volatility_short': volatility_short,
+            'volatility_long': volatility_long,
+            'skew': skew,
+            'kurtosis': kurtosis,
+            'momentum_short': momentum_short,
+            'momentum_long': momentum_long,
+            'efficiency_ratio': efficiency_ratio
+        })
         
-        # 6. Normalize
-        # Z-Score Normalization with rolling window to prevent look-ahead bias in training
-        # But for 'generate_all_features' (batch), we can use a large rolling window
-        # or just normalize the whole set if it's for training. 
-        # Ideally, we use a rolling window.
+        # 6. Normalize (Strictly Causal Rolling Z-Score)
+        # We normalize each feature by its OWN rolling history.
+        # This ensures that a value of "2.0" today means "2 sigma deviation from the recent mean",
+        # which is a stationary signal suitable for ML.
         
-        normalized_features = self.z_score_normalize(features)
+        normalized_features = self.rolling_z_score(features, window=window_size*2)
         
-        return normalized_features
+        return normalized_features.dropna()
 
-    def z_score_normalize(self, df: pd.DataFrame, window: int = 2000) -> pd.DataFrame:
+    def rolling_z_score(self, df: pd.DataFrame, window: int) -> pd.DataFrame:
         """
-        Normalize features using a rolling Z-Score to ensure stationarity.
-        (Value - Mean) / Std
+        Normalize features using a rolling Z-Score to ensure stationarity and causality.
+        (Value - RollingMean) / RollingStd
         """
-        rolling_mean = df.rolling(window=window, min_periods=100).mean()
-        rolling_std = df.rolling(window=window, min_periods=100).std()
+        # Use a large window to capture the "regime" distribution
+        rolling_mean = df.rolling(window=window, min_periods=window//2).mean()
+        rolling_std = df.rolling(window=window, min_periods=window//2).std()
         
         # Avoid division by zero
         rolling_std = rolling_std.replace(0, 1e-8)
         
         z_score = (df - rolling_mean) / rolling_std
         
-        # Clip outliers to +/- 4 sigma
+        # Clip outliers to +/- 4 sigma to preserve numerical stability
         return z_score.clip(-4, 4)
 
-    def get_smooth_price(self, series: pd.Series, window_length: int = 11) -> pd.Series:
+    def get_efficiency_ratio(self, close: pd.Series, window: int = 10) -> pd.Series:
         """
-        Apply EMA smoothing.
+        Kaufman Efficiency Ratio: Direction / Volatility
+        Abs(P_t - P_{t-n}) / Sum(Abs(P_i - P_{i-1}))
+        High values indicate smooth trends, low values indicate chop.
         """
-        return series.ewm(span=window_length).mean()
-
-    def get_kinematics(self, smooth_log_price: pd.Series) -> pd.DataFrame:
-        """
-        Calculate Velocity and Acceleration on Log-Prices.
-        Velocity = diff(log_price) ~= Returns
-        Acceleration = diff(Velocity)
-        """
-        velocity = smooth_log_price.diff()
-        acceleration = velocity.diff()
-        return pd.DataFrame({'velocity': velocity, 'acceleration': acceleration})
-
-    def get_dsp_features(self, log_price: pd.Series) -> pd.DataFrame:
-        """
-        Extract Analytic Signal features.
-        """
-        # Detrend log-price for Hilbert
-        # Using a high-pass filter (price - rolling_mean)
-        centered = log_price - log_price.rolling(window=20).mean()
-        centered = centered.fillna(0)
+        change = (close - close.shift(window)).abs()
+        volatility = (close - close.shift(1)).abs().rolling(window=window).sum()
         
-        analytic_signal = hilbert(centered.values)
-        amplitude_envelope = np.abs(analytic_signal)
-        instantaneous_phase = np.angle(analytic_signal)
-        
-        return pd.DataFrame({
-            'amplitude': amplitude_envelope,
-            'phase': instantaneous_phase
-        }, index=log_price.index)
+        return change / volatility.replace(0, 1e-8)
 
-    def get_regime_features(self, close: pd.Series, window: int = 100) -> pd.DataFrame:
-        """
-        Calculate Hurst Exponent and Shannon Entropy.
-        """
-        hurst = close.rolling(window=window).apply(self._calculate_hurst_exponent, raw=True)
-        entropy = close.rolling(window=window).apply(self._calculate_shannon_entropy, raw=True)
-        
-        return pd.DataFrame({'hurst': hurst, 'entropy': entropy})
-
-    def _calculate_hurst_exponent(self, ts: np.ndarray) -> float:
-        """
-        Calculate the Hurst Exponent.
-        """
-        lags = range(2, 20)
-        # Standard deviation of differences
-        tau = [np.sqrt(np.std(np.subtract(ts[lag:], ts[:-lag]))) for lag in lags]
-        
-        # Avoid log(0)
-        if np.any(np.array(tau) <= 0):
-            return 0.5
-            
-        poly = np.polyfit(np.log(lags), np.log(tau), 1)
-        return poly[0] * 2.0 
-
-    def _calculate_shannon_entropy(self, ts: np.ndarray) -> float:
-        """
-        Calculate Shannon Entropy of returns.
-        """
-        returns = np.diff(ts) / ts[:-1]
-        # Handle zeros/NaNs
-        returns = returns[~np.isnan(returns)]
-        if len(returns) == 0:
-            return 0.0
-            
-        hist, _ = np.histogram(returns, bins=10, density=True)
-        hist = hist[hist > 0]
-        return -np.sum(hist * np.log(hist))
-
-    def get_fracdiff(self, log_price: pd.Series, d: float = 0.4, window: int = 20) -> pd.Series:
-        """
-        Apply Fractional Differentiation to Log-Prices.
-        """
-        weights = self._get_weights_ffd(d, window)
-        res = 0
-        for k in range(window):
-            res += weights[k] * log_price.shift(k)
-            
-        return res.dropna()
-
-    def _get_weights_ffd(self, d: float, size: int) -> np.ndarray:
-        w = [1.0]
-        for k in range(1, size):
-            w_k = -w[-1] * (d - k + 1) / k
-            w.append(w_k)
-        return np.array(w)

@@ -8,67 +8,51 @@ from src.execution import ExecutionManager
 # Configuration
 SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1h'
-EXCHANGE_ID = 'binance' # Example
+EXCHANGE_ID = 'binance' 
 API_KEY = os.getenv('API_KEY', '')
 SECRET = os.getenv('SECRET', '')
 SANDBOX = True
 
 async def main():
-    print("Starting Math-First Trading Bot...")
+    print("Starting Math-First Trading Bot (Strict Causal Mode)...")
     
     # Initialize Components
     execution = ExecutionManager(EXCHANGE_ID, API_KEY, SECRET, sandbox=SANDBOX)
     kinematics = CryptoKinematics()
     strategy = SignalGenerator()
     
-    # Initial Training Data Load
-    print("Fetching historical data for training (1000 candles)...")
-    history = await execution.exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=1000)
-    df_history = pd.DataFrame(history, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df_history['timestamp'] = pd.to_datetime(df_history['timestamp'], unit='ms')
-    df_history.set_index('timestamp', inplace=True)
-    
-    print("Training initial model...")
-    # Feature Engineering for Training
-    smooth_price_train = kinematics.get_smooth_price(df_history['close'])
-    kin_feats_train = kinematics.get_kinematics(smooth_price_train)
-    dsp_feats_train = kinematics.get_dsp_features(df_history['close'])
-    # regime_feats_train = kinematics.get_regime_features(df_history['close']) # Not needed for training input, only for filter
-    regime_feats_train = kinematics.get_regime_features(df_history['close']) # REQUIRED for model features
-    fracdiff_train = kinematics.get_fracdiff(df_history['close'])
-    
-    features_train = strategy.prepare_features(kin_feats_train, dsp_feats_train, fracdiff_train, regime_feats_train)
-    
-    # Align price with features
-    common_index = features_train.index.intersection(df_history.index)
-    features_train = features_train.loc[common_index]
-    price_train = df_history['close'].loc[common_index]
-    
+    # Load Model (or train if missing)
     model_path = 'models/optimized_model.json'
     if os.path.exists(model_path):
-        print(f"Loading optimized model from {model_path}...")
         strategy.load_model(model_path)
     else:
-        print("Training initial model...")
-        strategy.train_model(features_train, price_train)
-        print("Model trained successfully.")
-    
+        print("No model found. Training on historical data...")
+        # Fetch enough data for training
+        history = await execution.exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=3000)
+        df_hist = pd.DataFrame(history, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df_hist['timestamp'] = pd.to_datetime(df_hist['timestamp'], unit='ms')
+        df_hist.set_index('timestamp', inplace=True)
+        
+        # Train
+        features = kinematics.generate_all_features(df_hist['close'])
+        
+        # Align
+        common = features.index.intersection(df_hist.index)
+        strategy.train_model(features.loc[common], df_hist['close'].loc[common])
+        strategy.save_model(model_path)
+
     try:
         while True:
             print(f"Fetching latest data for {SYMBOL}...")
-            ohlcv = await execution.exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=200)
+            # Need enough context for rolling windows (e.g. 500)
+            ohlcv = await execution.exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=1000)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
             
-            # Feature Engineering
-            smooth_price = kinematics.get_smooth_price(df['close'])
-            kin_feats = kinematics.get_kinematics(smooth_price)
-            dsp_feats = kinematics.get_dsp_features(df['close'])
-            regime_feats = kinematics.get_regime_features(df['close'])
-            fracdiff = kinematics.get_fracdiff(df['close'])
-            
-            features = strategy.prepare_features(kin_feats, dsp_feats, fracdiff, regime_feats)
+            # Feature Generation
+            # This generates features for the whole window, but we only use the last one for prediction
+            features = kinematics.generate_all_features(df['close'])
             
             if features.empty:
                 print("Not enough data for features.")
@@ -78,46 +62,23 @@ async def main():
             current_feat = features.iloc[[-1]]
             idx = current_feat.index[0]
             
-            # Signal Generation
+            # Inference
             prob = strategy.predict_signal(current_feat)
-            acc = features.loc[idx, 'acceleration']
-            hurst = regime_feats.loc[idx, 'hurst']
-            entropy = regime_feats.loc[idx, 'entropy']
             
-            regime_action = strategy.regime_filter(entropy, hurst)
-            trigger = strategy.get_trigger(regime_action, hurst, acc, prob)
+            # Volatility for Sizing
+            vol = current_feat['volatility_short'].iloc[0] if 'volatility_short' in current_feat else 0.01
             
-            print(f"Time: {idx}, Trigger: {trigger}, Prob: {prob:.2f}, Hurst: {hurst:.2f}, Entropy: {entropy:.2f}")
+            action = strategy.get_action(prob)
+            leverage = strategy.get_leverage(prob, vol)
             
-            # Execution
-            if trigger == 'LONG':
-                # Calculate size
-                ticker = await execution.exchange.fetch_ticker(SYMBOL)
-                price = ticker['ask']
-                equity = 100 # Mock equity or fetch balance
-                # balance = await execution.exchange.fetch_balance()
-                # equity = balance['total']['USDT']
-                
-                # ATR calculation needed for sizing
-                high = df['high']
-                low = df['low']
-                close = df['close']
-                tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
-                atr = tr.rolling(14).mean().iloc[-1]
-                
-                size = execution.calculate_position_size(equity, atr)
-                size = await execution.check_dust(SYMBOL, size)
-                
-                if size > 0:
-                    await execution.place_post_only_order(SYMBOL, 'buy', size)
-                    
-            elif trigger == 'SHORT':
-                # Similar logic for short
-                pass
+            print(f"Time: {idx}, Action: {action}, LVG: {leverage:.2f}x, Prob: {prob:.2f}")
+            
+            # Execution logic would go here
+            # For now just logging
             
             # Wait for next candle
-            print("Analysis complete. Waiting 60 seconds for next cycle...")
-            await asyncio.sleep(60) # Reduced to 60s for testing (was 1 hour)
+            print("Analysis complete. Waiting 60 seconds...")
+            await asyncio.sleep(60)
             
     except KeyboardInterrupt:
         print("Stopping bot...")

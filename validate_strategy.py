@@ -1,431 +1,195 @@
 import pandas as pd
 import numpy as np
-from src.features import CryptoKinematics
-from src.strategy import SignalGenerator
-
-import ccxt.async_support as ccxt
-import asyncio
 import argparse
+import asyncio
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.ticker as mticker
-from datetime import datetime, timedelta
+from src.features import CryptoKinematics
+from src.strategy import SignalGenerator
+from src.data import fetch_historical_data
 
-from src.data import fetch_historical_data, generate_synthetic_data
+FEE_RATE = 0.001 # 0.1% fee per side (Binance Taker)
 
-def walk_forward_optimization(data: pd.DataFrame, train_window_days: int = 30, test_window_days: int = 7):
+def strict_backtest(data: pd.DataFrame, model_path: str = None, lookback_window: int = 500):
     """
-    Train on Month M, Test on M+1 (or week), roll forward.
-    Strictly prevents look-ahead bias by recalculating features at every step.
+    Strict Causal Backtest with Fees.
+    Logic:
+    1. Iterate time T.
+    2. Calc features on data[T-Window : T].
+    3. Predict T+1.
+    4. Execute with fees.
     """
-    print("Starting Walk-Forward Optimization (Strict No-Leakage Mode)...")
+    print("Starting STRICT CAUSAL Backtest...")
+    print(f"Transaction Fee: {FEE_RATE*100:.2f}% per trade")
+    
     strategy = SignalGenerator()
-    
-    # Parameters
-    train_size = train_window_days * 24
-    test_size = test_window_days * 24
-    lookback_buffer = 500 # Enough for Hilbert/Regime windows
-    
-    results = []
-    
-    total_steps = len(data) - train_size - test_size
-    step_counter = 0
-    
-    # Pre-calculate ALL features once (Vectorized)
-    # Note: Z-Score normalization uses a rolling window, so it is causal.
-    # However, to be strictly safe for WFO, we should ideally recalculate normalization params.
-    # But for performance, we will use the pre-calculated features which use a large rolling window.
-    # The 'generate_all_features' method in features.py uses rolling windows, so it respects causality
-    # as long as we don't use future data for the window calculation (which rolling() doesn't).
-    
-    print("Pre-calculating features for the entire dataset...")
-    kinematics = CryptoKinematics()
-    all_features = kinematics.generate_all_features(data['close'])
-    
-    for i in range(0, total_steps, test_size):
-        # Define Training Window
-        train_start_idx = i
-        train_end_idx = i + train_size
-        
-        # 1. Train Model
-        # Slice features directly
-        # We need to ensure indices align
-        train_indices = data.index[train_start_idx : train_end_idx]
-        valid_indices = all_features.index.intersection(train_indices)
-        
-        X_train = all_features.loc[valid_indices]
-        y_price = data['close'].loc[valid_indices]
-        
-        if len(X_train) > 100:
-            strategy.train_model(X_train, y_price)
-        
-        # 2. Test / Predict (Step-by-Step)
-        test_start_idx = train_end_idx
-        test_end_idx = test_start_idx + test_size
-        
-        # Loop through every candle in the test set
-        for j in range(test_start_idx, test_end_idx):
-            if j >= len(data):
-                break
-                
-            current_time = data.index[j]
-            
-            # Get pre-calculated feature row
-            if current_time not in all_features.index:
-                continue
-                
-            current_feat_row = all_features.loc[[current_time]]
-            
-            # Predict
-            prob = strategy.predict_signal(current_feat_row)
-            
-            # Calculate Volatility for Kelly (Simple 24h rolling std)
-            # We can also pre-calculate this, but it's fast enough
-            # Or use a rolling window on the price series
-            # Let's do a quick slice
-            hist_start = max(0, j - 24)
-            volatility = data['close'].iloc[hist_start:j].pct_change().std()
-            if pd.isna(volatility) or volatility == 0:
-                volatility = 0.01
-            
-            # Get Leverage (Signed)
-            leverage = strategy.get_leverage(prob, volatility)
-            
-            trigger = 'HOLD'
-            if leverage > 0:
-                trigger = 'LONG'
-            elif leverage < 0:
-                trigger = 'SHORT'
-                
-            results.append({
-                'timestamp': current_time,
-                'price': data['close'].iloc[j],
-                'trigger': trigger,
-                'prob': prob,
-                'leverage': abs(leverage)
-            })
-            
-        step_counter += 1
-        print(f"Completed Batch {step_counter}/{total_steps // test_size}...", end='\r')
-            
-    return pd.DataFrame(results)
-
-def run_static_backtest(data: pd.DataFrame, model_path: str):
-    """
-    Run backtest using a pre-trained model with STRICT CAUSALITY.
-    Features are re-calculated at every step using a sliding window.
-    """
-    print(f"Starting Strict Backtest with model: {model_path}")
-    strategy = SignalGenerator()
-    strategy.load_model(model_path)
     kinematics = CryptoKinematics()
     
-    results = []
-    window_size = 1000 # Must match training context or be sufficient for Hilbert
-    
-    # Ensure enough data
-    if len(data) <= window_size:
-        print("Not enough data for backtest window.")
-        return pd.DataFrame()
+    # Train Initial Model if not provided
+    if not model_path:
+        # Split first 30% for training
+        train_size = int(len(data) * 0.3)
+        train_data = data.iloc[:train_size]
+        test_data = data.iloc[train_size:]
         
-    print("Running Step-by-Step Backtest (may take a moment)...")
+        print(f"Training initial model on first {train_size} candles...")
+        features_train = kinematics.generate_all_features(train_data['close'], window_size=200)
+        
+        # Align
+        common = features_train.index.intersection(train_data.index)
+        strategy.train_model(features_train.loc[common], train_data['close'].loc[common])
+    else:
+        strategy.load_model(model_path)
+        test_data = data # Run on all if model provided (e.g. forward test)
+        # But we need warmup period
+        # Let's just run from index 500
+        pass
+
+    results = []
     
-    start_idx = window_size
-    total_steps = len(data) - start_idx
+    # We need a rolling window to generate features dynamically
+    # Testing Start Index
+    start_idx = lookback_window
+    
+    # If using test_data split
+    if not model_path:
+        # We perform Walk-Forward? Or just static holdout?
+        # Let's do Static Holdout for speed in this prompt, but with strict loop
+        full_df = data
+        start_idx = int(len(data) * 0.3)
+    else:
+        full_df = data
+    
+    total_steps = len(full_df) - start_idx
+    
+    position = 0 # 0, 1, -1
+    entry_price = 0.0
+    
+    # Equity Curve Tracking
+    equity = 100.0
+    equity_curve = [equity]
+    timestamps = [full_df.index[start_idx-1]]
+    
+    print(f"Running simulation on {total_steps} candles...")
     
     for i in range(total_steps):
-        # Current index in 'data'
         current_idx = start_idx + i
         
-        # 1. Define Causal Slice (Past to Present)
-        # We look back window_size to compute features for NOW
-        slice_start = max(0, current_idx - window_size)
-        current_slice = data.iloc[slice_start : current_idx + 1]
+        # 1. Causal Slice
+        # We need enough history for rolling windows (e.g. 200)
+        # Slicing is somewhat slow, but essential for causality proof
+        hist_start = max(0, current_idx - lookback_window)
+        current_slice = full_df.iloc[hist_start : current_idx + 1] # Includes current candle CLOSE
         
-        # 2. Generate Features
-        # The last row corresponds to 'current_idx'
-        features = kinematics.generate_all_features(current_slice['close'])
+        current_time = current_slice.index[-1]
+        current_price = current_slice['close'].iloc[-1]
+        
+        # 2. Generate Features (Latest row only)
+        # We generate the whole window then take the last row
+        features = kinematics.generate_all_features(current_slice['close'], window_size=200)
         
         if features.empty:
             continue
             
-        # 3. Predict on the latest feature vector
-        current_feat_row = features.iloc[[-1]]
-        prob = strategy.predict_signal(current_feat_row)
+        current_feat = features.iloc[[-1]] # DataFrame 1 row
         
-        # 4. Get Aux Data for Logic
-        # Handle cases where feature generation might drop early rows (not an issue for last row)
-        hurst = current_feat_row['hurst'].iloc[0] if 'hurst' in current_feat_row else 0.5
-        entropy = current_feat_row['entropy'].iloc[0] if 'entropy' in current_feat_row else 0
-        acc = current_feat_row['acceleration'].iloc[0] if 'acceleration' in current_feat_row else 0
+        # 3. Predict & Sizing
+        prob = strategy.predict_signal(current_feat)
         
-        # 5. Logic
-        regime = strategy.regime_filter(entropy, hurst)
-        trigger = strategy.get_trigger(regime, hurst, acc, prob)
+        # Calc Volatility for Sizing
+        # Using feature volatility or calc fresh
+        vol = current_feat['volatility_short'].iloc[0] if 'volatility_short' in current_feat else 0.01
         
-        # 6. Volatility for Sizing (Causal)
-        # Simple rolling std on the slice
-        volatility = current_slice['close'].pct_change().rolling(24).std().iloc[-1]
-        if pd.isna(volatility) or volatility == 0:
-            volatility = 0.01
+        target_action = strategy.get_action(prob, threshold=0.55)
+        leverage = strategy.get_leverage(prob, vol)
+        
+        # 4. Execution Engine (with Fees)
+        # Simple Reversal Logic
+        
+        new_position = 0
+        if target_action == 'LONG': new_position = 1
+        elif target_action == 'SHORT': new_position = -1
+        
+        # Apply Leverage Size
+        new_position = new_position * leverage
+        
+        # Check Change
+        # We iterate to apply PnL
+        
+        # PnL from PREVIOUS Step
+        if i > 0:
+            # Price Change
+            prev_price = full_df['close'].iloc[current_idx-1]
+            price_change = (current_price - prev_price) / prev_price
             
-        leverage = strategy.get_leverage(prob, volatility)
-        
-        results.append({
-            'timestamp': current_slice.index[-1],
-            'price': current_slice['close'].iloc[-1],
-            'trigger': trigger,
-            'prob': prob,
-            'leverage': abs(leverage) if trigger != 'HOLD' else 0
-        })
-        
-        if i % 100 == 0:
-             print(f"Processed {i}/{total_steps} candles...", end='\r')
+            # Position PnL
+            step_pnl = position * price_change
+            equity = equity * (1 + step_pnl)
             
-    return pd.DataFrame(results)
-
-def save_trade_log(results: pd.DataFrame, filename='results/trade_log.csv'):
-    """
-    Save trade log to CSV.
-    """
-    trades = []
-    position = 0
-    entry_price = 0
-    entry_time = None
-    
-    for i in range(1, len(results)):
-        prev_row = results.iloc[i-1]
-        curr_row = results.iloc[i]
-        
-        # Close position
-        if position != 0:
-            exit_price = curr_row['price']
-            pnl = (exit_price - entry_price) / entry_price
-            if position == -1:
-                pnl = -pnl
+        # Trade Execution Cost
+        # If position changed significantly
+        if abs(new_position - position) > 0.01:
+            # We traded
+            # Fee logic: Fee paid on NOTIONAL value traded
+            # Notional Traded = abs(new_pos - old_pos) * Equity
+            # Fee = Notional * Rate
             
-            trades.append({
-                'Entry Time': entry_time,
-                'Exit Time': curr_row.name,
-                'Type': 'LONG' if position > 0 else 'SHORT',
-                'Entry Price': entry_price,
-                'Exit Price': exit_price,
-                'Leverage': f"{abs(position)}x",
-                'PnL': pnl
+            trade_size = abs(new_position - position)
+            fee_cost = trade_size * FEE_RATE
+            
+            # Reduce Equity
+            equity = equity * (1 - fee_cost)
+            
+            results.append({
+                'timestamp': current_time,
+                'action': 'TRADE',
+                'size': trade_size,
+                'cost': fee_cost,
+                'equity': equity
             })
-            position = 0
             
-        # Open position
-        if prev_row['trigger'] == 'LONG':
-            position = prev_row['leverage']
-            entry_price = curr_row['price']
-            entry_time = curr_row.name
-        elif prev_row['trigger'] == 'SHORT':
-            position = -prev_row['leverage']
-            entry_price = curr_row['price']
-            entry_time = curr_row.name
-            
-    df_trades = pd.DataFrame(trades)
-    if not df_trades.empty:
-        df_trades.to_csv(filename, index=False)
-        print(f"Trade log saved to '{filename}'")
-        print("\n--- Recent Trades ---")
-        print(df_trades.tail().to_string(index=False))
-    else:
-        print("No trades executed.")
+        # Update State
+        position = new_position
         
-    return df_trades
-
-def monte_carlo_simulation(returns: pd.Series, n_sims: int = 1000, block_size: int = 240):
-    """
-    Block Bootstrapping Monte Carlo Simulation.
-    """
-    print(f"Running {n_sims} Monte Carlo Simulations...")
-    sim_results = []
-    
-    if len(returns) < block_size:
-        print(f"Warning: Not enough data for Monte Carlo (Need {block_size}, got {len(returns)}). Skipping.")
-        return np.zeros((n_sims, len(returns)))
-
-    for _ in range(n_sims):
-        # Block Bootstrap
-        sim_returns = []
-        while len(sim_returns) < len(returns):
-            start = np.random.randint(0, len(returns) - block_size)
-            block = returns.iloc[start : start+block_size].values
-            sim_returns.extend(block)
-            
-        sim_returns = sim_returns[:len(returns)]
-        sim_path = np.cumprod(1 + np.array(sim_returns))
-        sim_results.append(sim_path)
+        equity_curve.append(equity)
+        timestamps.append(current_time)
         
-    return np.array(sim_results)
-
-def calculate_metrics(results: pd.DataFrame):
-    """
-    Calculate Sharpe, Calmar, and Ruin Probability.
-    """
-    # Simulate simple PnL
-    results['return'] = 0.0
-    position = 0
-    entry_price = 0
+        if i % 500 == 0:
+            print(f"Simulated {i}/{total_steps} | Eq: {equity:.2f} | Pos: {position:.2f}", end='\r')
+            
+    # Metrics
+    equity_series = pd.Series(equity_curve, index=timestamps)
+    returns = equity_series.pct_change().dropna()
     
-    for i in range(1, len(results)):
-        prev_row = results.iloc[i-1]
-        curr_row = results.iloc[i]
-        
-        # Close position
-        if position != 0:
-            ret = (curr_row['price'] - entry_price) / entry_price
-            if position < 0:
-                ret = -ret
-            
-            # Apply Leverage
-            ret = ret * abs(position)
-            
-            results.loc[curr_row.name, 'return'] = ret
-            position = 0 # Simple 1-step hold for testing
-            
-        # Open position
-        if prev_row['trigger'] == 'LONG':
-            position = prev_row['leverage']
-            entry_price = curr_row['price']
-        elif prev_row['trigger'] == 'SHORT':
-            position = -prev_row['leverage']
-            entry_price = curr_row['price']
-            
-    returns = results['return']
-    sharpe = np.mean(returns) / np.std(returns) * np.sqrt(24*365) if np.std(returns) != 0 else 0
+    total_ret = (equity - 100) / 100
+    sharpe = returns.mean() / returns.std() * np.sqrt(24*365) if returns.std() > 0 else 0
+    max_drawdown = (equity_series / equity_series.cummax() - 1).min()
     
-    cum_returns = (1 + returns).cumprod()
-    max_drawdown = 1 - cum_returns / cum_returns.cummax()
-    calmar = returns.mean() * 24 * 365 / max_drawdown.max() if max_drawdown.max() != 0 else 0
-    
+    print("\n\n--- Strict Backtest Results ---")
+    print(f"Total Return: {total_ret:.2%}")
     print(f"Sharpe Ratio: {sharpe:.2f}")
-    print(f"Calmar Ratio: {calmar:.2f}")
-    
-    return returns
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Validate Strategy')
-    parser.add_argument('--real', action='store_true', help='Use real historical data instead of synthetic')
-    parser.add_argument('--limit', type=int, default=2000, help='Number of historical candles to fetch (default: 2000)')
-    parser.add_argument('--end', type=str, help='End date for backtest (YYYY-MM-DD). Default: Now')
-    parser.add_argument('--model_path', type=str, help='Path to pre-trained model (e.g., models/xgb_model.json). If set, skips WFO.')
-    args = parser.parse_args()
-
-    data_source = "Synthetic (Random Walk)"
-    if args.real:
-        data_source = "Real Market (Binance BTC/USDT)"
-        # 1. Fetch Real Data
-        df = asyncio.run(fetch_historical_data(limit=args.limit, end_date=args.end))
-        print(f"\n--- Backtest Results ({data_source}: {args.limit} candles) ---")
-    else:
-        # 1. Generate Synthetic Data
-        print(f"\n--- Backtest Results ({data_source}) ---")
-        df = generate_synthetic_data(hours=args.limit, end_date=args.end)
-    
-    print(f"Timeframe: {df.index[0]} to {df.index[-1]}")
-    print(f"Duration:  {df.index[-1] - df.index[0]}")
-    
-    # 2. Backtest
-    if args.model_path:
-        results = run_static_backtest(df, args.model_path)
-    else:
-        results = walk_forward_optimization(df)
-    
-    if not results.empty:
-        results.set_index('timestamp', inplace=True)
-    
-    # 3. Metrics & Logging
-    save_trade_log(results)
-    returns = calculate_metrics(results)
-    
-    total_return = (1 + returns).prod() - 1
-    print(f"Total Return: {total_return:.2%}")
-
-    # Visualization
-    if returns.empty:
-        print("No returns to visualize.")
-        import sys
-        sys.exit(0)
-
-    starting_capital = 100.0
-    equity_curve = starting_capital * (1 + returns).cumprod()
-    ending_capital = equity_curve.iloc[-1]
-    
-    print(f"\n--- Account Summary ---")
-    print(f"Data Source:      {data_source}")
-    print(f"Leverage Used:    Dynamic (1x - 3x)")
-    print(f"Starting Capital: ${starting_capital:.2f}")
-    print(f"Ending Capital:   ${ending_capital:.2f}")
-    print(f"Net Profit:       ${ending_capital - starting_capital:.2f}")
-    
-    # Trade Stats
-    if 'return' in results.columns:
-        trades = results[results['return'] != 0]['return']
-        n_trades = len(trades)
-        if n_trades > 0:
-            win_rate = len(trades[trades > 0]) / n_trades
-            avg_pnl = trades.mean()
-            best_trade = trades.max()
-            worst_trade = trades.min()
-            
-            print(f"\n--- Trade Statistics ---")
-            print(f"Total Trades:     {n_trades}")
-            print(f"Win Rate:         {win_rate:.2%}")
-            print(f"Avg PnL / Trade:  {avg_pnl:.2%}")
-            print(f"Best Trade:       {best_trade:.2%}")
-            print(f"Worst Trade:      {worst_trade:.2%}")
-            print(f"Compounding:      (1 + {avg_pnl:.4f}) ^ {n_trades} ≈ {(1+avg_pnl)**n_trades:.2f}x")
+    print(f"Max Drawdown: {max_drawdown:.2%}")
+    print(f"Final Equity: ${equity:.2f}")
     
     # Plot
-    plt.figure(figsize=(12, 6))
-    plt.plot(equity_curve.index, equity_curve.values, label='Equity Curve')
-    plt.title(f'Strategy Performance: {data_source}')
-    plt.xlabel('Date')
-    plt.ylabel('Equity ($)')
-    plt.legend()
-    plt.grid(True)
+    plt.figure(figsize=(10, 6))
+    plt.plot(equity_series)
+    plt.title(f"Strict Causal Backtest (Fees={FEE_RATE*100}%)")
+    plt.ylabel("Equity ($)")
+    plt.yscale('log')
+    plt.grid(True, which='both', alpha=0.3)
+    plt.savefig('results/strict_backtest.png')
+    print("Plot saved to results/strict_backtest.png")
     
-    # Format Y-Axis ($)
-    plt.gca().yaxis.set_major_formatter(mticker.StrMethodFormatter('${x:,.0f}'))
-    
-    # Format Date Axis
-    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
-    plt.gca().xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=12))
-    plt.gcf().autofmt_xdate() # Rotate labels
-    
-    plt.savefig('results/backtest_equity.png')
-    print("\nVisualization saved to 'results/backtest_equity.png'")
+    return equity_series
 
-    # Log Plot (for consistency check)
-    plt.figure(figsize=(12, 6))
-    plt.semilogy(equity_curve.index, equity_curve.values, label='Equity Curve (Log Scale)')
-    plt.title(f'Strategy Performance: {data_source} (Log Scale)')
-    plt.xlabel('Date')
-    plt.ylabel('Equity ($) - Log Scale')
-    plt.legend()
-    plt.grid(True, which="both", ls="-", alpha=0.5)
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--limit', type=int, default=3000)
+    parser.add_argument('--model_path', type=str, default=None)
+    parser.add_argument('--symbol', type=str, default='BTC/USDT')
+    args = parser.parse_args()
     
-    # Format Y-Axis ($)
-    plt.gca().yaxis.set_major_formatter(mticker.StrMethodFormatter('${x:,.0f}'))
-    
-    # Format Date Axis
-    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
-    plt.gca().xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=12))
-    plt.gcf().autofmt_xdate() # Rotate labels
-    
-    plt.savefig('results/backtest_equity_log.png')
-    print("Log-Scale Visualization saved to 'results/backtest_equity_log.png'")
-    
-    # 4. Monte Carlo
-    sim_paths = monte_carlo_simulation(returns)
-    
-    # Probability of Ruin (hitting 0 or -50% etc)
-    # Assuming starting equity 1.0
-    ruin_threshold = 0.5
-    ruins = np.sum([np.min(path) < ruin_threshold for path in sim_paths])
-    prob_ruin = ruins / len(sim_paths)
-    
-    print(f"Probability of Ruin (< {ruin_threshold}): {prob_ruin:.2%}")
+    df = asyncio.run(fetch_historical_data(symbol=args.symbol, limit=args.limit))
+    strict_backtest(df, args.model_path)
